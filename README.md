@@ -8,6 +8,12 @@ is detected **per phrase**, so a stream can go back and forth freely.
 The app lives in the **system tray** (the blue 字 icon) and draws captions in an always-on-top
 overlay that floats over every window, including browsers, players and borderless-fullscreen games.
 
+- **Near word-by-word:** captions update about every 0.3 s while someone is talking, even on a CPU.
+  Words two updates agree on are drawn solid; the newest, still-changing words are faded.
+- **Self-correcting:** when a phrase ends it becomes a caption immediately, then a second, more careful pass
+  re-listens to it in the background. If it hears something different, the caption already on screen is
+  corrected in place (and in the caption history and transcript).
+
 ![Bilingual captions: Japanese and English lines, with the in-progress phrase faded](docs/overlay-bilingual.png)
 
 <table>
@@ -27,7 +33,8 @@ Grab `WhisperLiveSubs-<version>-win64.zip` from [Releases](../../releases), extr
 **`WhisperLiveSubs.exe`**. It's portable: models download into the `models` folder next to the exe on first use.
 Windows SmartScreen may warn because the exe is unsigned: click *More info* → *Run anyway*.
 
-The exe build runs on the CPU. For NVIDIA GPU acceleration, use the Python version below.
+With an NVIDIA card, open Settings → Model and click **Install GPU support** (one-time ~1.2 GB download of
+NVIDIA's cuBLAS/cuDNN libraries into a `cuda` folder next to the exe).
 
 ## Run from source
 
@@ -64,13 +71,18 @@ or a local folder.
 
 ### NVIDIA GPU
 
-`setup.bat` installs the CUDA libraries automatically when it finds an NVIDIA GPU. To add them by hand:
+Settings → Model shows a **GPU** line explaining exactly what it found: no NVIDIA card/driver, a driver too old
+for CUDA 12, missing GPU libraries (with an **Install GPU support** button), or ready. The tray tooltip also says
+why the GPU isn't being used. With Device = *Auto*, the GPU is used whenever it works; otherwise the app falls
+back to the CPU and tells you why.
+
+The from-source setup installs the same libraries when it finds an NVIDIA GPU. To add them by hand:
 
 ```bash
 .venv\Scripts\python -m pip install -r requirements-gpu.txt
 ```
 
-Device = *Auto* then uses the GPU. If the GPU fails, the app falls back to CPU and tells you.
+A virtual machine (VirtualBox, etc.) can't use the host's graphics card, so run the app on the host to use the GPU.
 
 ## Language options (Settings → Language)
 
@@ -79,7 +91,8 @@ Device = *Auto* then uses the GPU. If the GPU fails, the app falls back to CPU a
   mistaken for Chinese. It also slightly favours the language the streamer was just speaking, which
   keeps one-word replies like "うん" or "yeah" stable.
 - **Captions show**: what was said; English (Japanese gets translated); or both, with the
-  translation underneath in its own colour.
+  translation underneath in its own colour (added by the second pass, about a second later).
+- **Correct captions after they appear**: the second pass described above. Turn it off to save CPU.
 - **Vocabulary hint**: streamer, game and member names help Whisper spell them correctly.
 - **Voice detection threshold / pause / max phrase length**: tune these for music-heavy streams.
 - **Hallucination filter**: drops Whisper's classic junk on silence or music
@@ -126,7 +139,9 @@ in [tools/make_screenshots.py](tools/make_screenshots.py), then reference the fi
 ```
 Whisper Live Subs.bat   launcher (no console)
 setup.bat               one-time dependency install
-livesubs/engine.py      VAD + streaming Whisper + per-phrase language detection
+livesubs/engine.py      VAD + streaming captions, instant finals, second-pass corrections
+livesubs/decoder.py     fast Whisper decoding (encoder window sized to the phrase)
+livesubs/gpu.py         NVIDIA detection + on-demand CUDA library install
 livesubs/audio.py       WASAPI loopback / microphone capture → 16 kHz mono
 livesubs/overlay.py     caption window (outlined text, click-through, drag/resize)
 livesubs/settings_dialog.py, app.py, hotkeys.py, config.py

@@ -18,9 +18,16 @@ EDGE = 10  # px grab zone for resizing
 
 @dataclass
 class _Line:
-    text: str
-    color: QColor
+    runs: list[tuple[str, QColor]]  # consecutive pieces drawn in different colours
     italic: bool
+
+    @property
+    def text(self) -> str:
+        return "".join(t for t, _ in self.runs)
+
+
+def _line(text: str, color: QColor, italic: bool) -> _Line:
+    return _Line([(text, color)], italic)
 
 
 @dataclass
@@ -29,6 +36,8 @@ class _Entry:
     lang: str
     translation: str = ""
     translated: bool = False
+    id: int = 0
+    stable: int = -1   # partials: chars confirmed by two passes (-1 = all)
 
 
 def _tag(lang: str, translated: bool) -> str:
@@ -78,13 +87,21 @@ class CaptionOverlay(QWidget):
                 self.show()
         self._relayout()
 
-    def add_final(self, text: str, lang: str, translation: str, translated: bool) -> None:
+    def add_final(self, fid: int, text: str, lang: str, translation: str, translated: bool) -> None:
         self.partial = None
-        self.entries.append(_Entry(text, lang, translation, translated))
+        self.entries.append(_Entry(text, lang, translation, translated, fid))
         self._touch()
 
-    def set_partial(self, text: str, lang: str) -> None:
-        self.partial = _Entry(text, lang) if text else None
+    def revise(self, fid: int, text: str, lang: str, translation: str, translated: bool) -> None:
+        """Correct a caption that is (still) on screen."""
+        for e in self.entries:
+            if e.id == fid:
+                e.text, e.lang, e.translation, e.translated = text, lang, translation, translated
+                self._relayout()
+                return
+
+    def set_partial(self, text: str, lang: str, stable: int = -1) -> None:
+        self.partial = _Entry(text, lang, stable=stable) if text else None
         self._touch()
 
     def show_status(self, text: str, seconds: float = 4.0) -> None:
@@ -127,6 +144,9 @@ class CaptionOverlay(QWidget):
         return f
 
     def _wrap(self, text: str, font: QFont, width: float) -> list[str]:
+        return [t for _, t in self._wrap_spans(text, font, width)]
+
+    def _wrap_spans(self, text: str, font: QFont, width: float) -> list[tuple[int, str]]:
         layout = QTextLayout(text, font)
         opt = QTextOption()
         opt.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
@@ -138,9 +158,11 @@ class CaptionOverlay(QWidget):
             if not line.isValid():
                 break
             line.setLineWidth(width)
-            out.append(text[line.textStart():line.textStart() + line.textLength()].strip())
+            raw = text[line.textStart():line.textStart() + line.textLength()]
+            lead = len(raw) - len(raw.lstrip())
+            out.append((line.textStart() + lead, raw.strip()))
         layout.endLayout()
-        return [s for s in out if s]
+        return [(i, t) for i, t in out if t]
 
     def _entry_lines(self, e: _Entry, partial: bool, width: float) -> list[_Line]:
         c = self.cfg
@@ -152,14 +174,25 @@ class CaptionOverlay(QWidget):
         else:
             color = QColor(c.text_color)
         italic = partial and c.partial_style == "italic"
+        tag = _tag(e.lang, e.translated) if tags and e.lang else ""
+        text = tag + e.text
+        font = self._font(italic)
         if partial and c.partial_style == "dim":
-            color.setAlphaF(color.alphaF() * 0.7)
-        text = (_tag(e.lang, e.translated) if tags and e.lang else "") + e.text
-        lines = [_Line(t, color, italic) for t in self._wrap(text, self._font(italic), width)]
+            # Words two passes agree on are solid; the newest, still-changing words are faded.
+            faded = QColor(color)
+            faded.setAlphaF(color.alphaF() * 0.55)
+            stable = len(text) if e.stable < 0 else len(tag) + e.stable
+            lines = []
+            for start, t in self._wrap_spans(text, font, width):
+                cut = max(0, min(len(t), stable - start))
+                runs = [(t[:cut], color), (t[cut:], faded)]
+                lines.append(_Line([r for r in runs if r[0]], italic))
+        else:
+            lines = [_line(t, color, italic) for t in self._wrap(text, font, width)]
         if e.translation:
             tcolor = QColor(c.translation_color)
             ttext = ("[EN] " if tags else "") + e.translation
-            lines += [_Line(t, tcolor, italic) for t in self._wrap(ttext, self._font(italic), width)]
+            lines += [_line(t, tcolor, italic) for t in self._wrap(ttext, font, width)]
         return lines
 
     def _content_width(self) -> float:
@@ -177,12 +210,12 @@ class CaptionOverlay(QWidget):
         lines = lines[-max(1, c.max_lines):]
         if self.status_text:
             col = QColor("#ffcfd8dc")
-            lines += [_Line(t, col, True) for t in self._wrap(self.status_text, self._font(True), width)]
+            lines += [_line(t, col, True) for t in self._wrap(self.status_text, self._font(True), width)]
         if not lines and not c.locked:
             hint = ("Captions appear here · drag to move · drag sides to resize · "
                     "Ctrl+scroll for size · lock from tray")
             col = QColor("#ccffffff")
-            lines = [_Line(t, col, True) for t in self._wrap(hint, self._font(True), width)]
+            lines = [_line(t, col, True) for t in self._wrap(hint, self._font(True), width)]
         self._lines = lines
 
         fm = QFontMetricsF(self._font())
@@ -253,16 +286,19 @@ class CaptionOverlay(QWidget):
                 x = self.width() - pad - 2 - w
             else:
                 x = (self.width() - w) / 2
-            path = QPainterPath()
-            path.addText(QPointF(x, y + base.ascent()), font, line.text)
-            if c.shadow and shadow_col.alpha() > 0:
-                sp = path.translated(c.shadow_offset, c.shadow_offset)
-                if c.outline_width > 0:
-                    p.strokePath(sp, shadow_pen)
-                p.fillPath(sp, shadow_col)
-            if c.outline_width > 0 and QColor(c.outline_color).alpha() > 0:
-                p.strokePath(path, outline_pen)
-            p.fillPath(path, line.color)
+            fm = metrics(line.italic)
+            for run_text, run_color in line.runs:
+                path = QPainterPath()
+                path.addText(QPointF(x, y + base.ascent()), font, run_text)
+                if c.shadow and shadow_col.alpha() > 0:
+                    sp = path.translated(c.shadow_offset, c.shadow_offset)
+                    if c.outline_width > 0:
+                        p.strokePath(sp, shadow_pen)
+                    p.fillPath(sp, shadow_col)
+                if c.outline_width > 0 and QColor(c.outline_color).alpha() > 0:
+                    p.strokePath(path, outline_pen)
+                p.fillPath(path, run_color)
+                x += fm.horizontalAdvance(run_text)
             y += line_h
         p.end()
 

@@ -73,6 +73,7 @@ class Config:
     show_language_tags: bool = False
     initial_prompt: str = ""
     live_partials: bool = True
+    refine_captions: bool = True    # second pass corrects captions already on screen
     vad_threshold: float = 0.5
     silence_ms: int = 600
     max_phrase_s: float = 10.0

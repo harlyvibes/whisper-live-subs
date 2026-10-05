@@ -59,7 +59,7 @@ def backdrop(w: int, h: int, dpr: float) -> QImage:
 def overlay_shot(cfg: Config, name: str, lines, partial=None, w=1280, h=520) -> None:
     ov = CaptionOverlay(cfg)
     for text, lang, trans, translated in lines:
-        ov.add_final(text, lang, trans, translated)
+        ov.add_final(len(ov.entries) + 1, text, lang, trans, translated)
     if partial:
         ov.set_partial(*partial)
     dpr = ov.devicePixelRatioF() or 1.0
@@ -86,7 +86,7 @@ def main() -> None:
     overlay_shot(cfg, "overlay-bilingual.png", [
         ("みんなこんばんは！今日もよろしくね", "ja", "", False),
         ("OK chat, let's go — we're doing the English challenge today!", "en", "", False),
-    ], partial=("えっ、ちょっと待って…", "ja"))
+    ], partial=("えっ、ちょっと待って…それ本当に？", "ja", len("えっ、ちょっと待って…")))  # tail still faded
 
     both = cfg.copy()
     both.separate_ja_color = True

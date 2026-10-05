@@ -9,11 +9,12 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRectF, Qt
-from PySide6.QtGui import QActionGroup, QColor, QFont, QIcon, QPainter, QPalette, QPixmap
+from PySide6.QtGui import QActionGroup, QColor, QFont, QIcon, QPainter, QPalette, QPixmap, QTextCursor
 from PySide6.QtWidgets import (QApplication, QDialog, QHBoxLayout, QMenu, QPlainTextEdit, QStyleFactory,
                                QPushButton, QSystemTrayIcon, QVBoxLayout)
 
 from .config import APP_ID, APP_NAME, ENGINE_KEYS, FROZEN, MODELS, PROJECT_DIR, Config, model_is_downloaded
+from . import gpu
 from .engine import CaptionEngine
 from .hotkeys import GlobalHotkeys
 from .overlay import CaptionOverlay
@@ -68,12 +69,33 @@ class HistoryWindow(QDialog):
         lay.addWidget(self.text)
         lay.addLayout(row)
 
-    def append(self, line: str) -> None:
+        self._entries: dict[int, QTextCursor] = {}  # caption id -> selection of its text
+
+    def append(self, line: str, entry_id: int | None = None) -> None:
         sb = self.text.verticalScrollBar()
         at_bottom = sb.value() >= sb.maximum() - 4
         self.text.appendPlainText(line)
+        if entry_id is not None:
+            cur = QTextCursor(self.text.document())
+            cur.movePosition(QTextCursor.End)
+            end = cur.position()
+            cur.setPosition(end - len(line))
+            cur.setPosition(end, QTextCursor.KeepAnchor)
+            self._entries[entry_id] = cur
+            if len(self._entries) > 200:
+                self._entries.pop(next(iter(self._entries)))
         if at_bottom:
             sb.setValue(sb.maximum())
+
+    def replace(self, entry_id: int, line: str) -> None:
+        """Rewrite a caption the second pass corrected (cursors track earlier edits)."""
+        cur = self._entries.get(entry_id)
+        if cur is None or not cur.hasSelection():
+            return
+        start = cur.selectionStart()
+        cur.insertText(line)
+        cur.setPosition(start)
+        cur.setPosition(start + len(line), QTextCursor.KeepAnchor)
 
 
 class Controller(QObject):
@@ -91,6 +113,9 @@ class Controller(QObject):
         self.transcript_path: Path | None = None
         self.last_good_model: tuple[str, str] | None = None  # (model, custom_model) that loaded OK
         self.pending_note = ""  # shown again once the fallback model is listening
+        self.final_stamps: dict[int, str] = {}  # caption id -> time shown (history/transcripts)
+        self.gpu_reason = ""                     # why the GPU isn't used, if it isn't
+        self._gpu_reason_notified = ""
 
         self.overlay = CaptionOverlay(self.cfg)
         self.overlay.geometry_changed.connect(self._on_overlay_moved)
@@ -186,7 +211,9 @@ class Controller(QObject):
         self.act_status.setText(f"● {label}{info}")
         self.tray.setIcon(make_icon(state))
         tip = f"{APP_NAME}: {label}{info}"
-        if self.status:
+        if self.gpu_reason and self.running:
+            tip += "\nGPU not used: " + self.gpu_reason
+        elif self.status:
             tip += f"\n{self.status}"
         self.tray.setToolTip(tip[:127])
         self.act_run.setText("Stop captioning" if self.running else "Start captioning")
@@ -222,6 +249,9 @@ class Controller(QObject):
         e.state.connect(self._on_state)
         e.partial.connect(self.overlay.set_partial)
         e.final.connect(self._on_final)
+        e.revised.connect(self._on_revised)
+        e.settled.connect(self._on_settled)
+        e.gpu_problem.connect(self._on_gpu_problem)
         e.model_info.connect(self._on_model_info)
         e.load_failed.connect(self._on_load_failed)
         e.set_paused(self.paused)
@@ -237,13 +267,14 @@ class Controller(QObject):
             self.engine.stop()
             self.engine = None
         self.running = False
-        self.overlay.set_partial("", "")
+        self.overlay.set_partial("", "", 0)
         self.overlay.show_status("Captioning stopped.", 3)
         self._update_ui()
 
     @staticmethod
     def _disconnect(e: CaptionEngine) -> None:
-        for sig in (e.status, e.state, e.partial, e.final, e.model_info, e.load_failed):
+        for sig in (e.status, e.state, e.partial, e.final, e.revised, e.settled, e.model_info,
+                    e.load_failed, e.gpu_problem):
             try:
                 sig.disconnect()
             except (RuntimeError, TypeError):
@@ -288,16 +319,48 @@ class Controller(QObject):
         self.model_info = info
         self._update_ui()
 
-    def _on_final(self, text: str, lang: str, translation: str, translated: bool) -> None:
-        self.overlay.add_final(text, lang, translation, translated)
-        stamp = datetime.now().strftime("%H:%M:%S")
+    @staticmethod
+    def _history_line(stamp: str, text: str, lang: str, translation: str, translated: bool,
+                      corrected: bool = False) -> str:
         tag = f"{lang.upper()}→EN" if translated else lang.upper()
-        line = f"[{stamp}] [{tag}] {text}"
+        line = f"[{stamp}] [{tag}] {'✎ ' if corrected else ''}{text}"
         if translation:
-            line += f"\n{' ' * 11}[EN] {translation}"
-        self.history.append(line)
-        if self.cfg.save_transcript:
-            self._write_transcript(line)
+            line += "\n" + " " * 11 + f"[EN] {translation}"
+        return line
+
+    def _on_final(self, fid: int, text: str, lang: str, translation: str, translated: bool) -> None:
+        self.overlay.add_final(fid, text, lang, translation, translated)
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.final_stamps[fid] = stamp
+        if len(self.final_stamps) > 300:
+            self.final_stamps.pop(next(iter(self.final_stamps)))
+        self.history.append(self._history_line(stamp, text, lang, translation, translated), fid)
+
+    def _on_revised(self, fid: int, text: str, lang: str, translation: str, translated: bool) -> None:
+        """The second pass heard something different: correct the caption in place."""
+        self.overlay.revise(fid, text, lang, translation, translated)
+        stamp = self.final_stamps.get(fid, "--:--:--")
+        self.history.replace(fid, self._history_line(stamp, text, lang, translation, translated,
+                                                     corrected=True))
+
+    def _on_settled(self, fid: int, text: str, lang: str, translation: str, translated: bool) -> None:
+        if self.cfg.save_transcript:  # transcripts get the final, corrected version only
+            stamp = self.final_stamps.get(fid, datetime.now().strftime("%H:%M:%S"))
+            self._write_transcript(self._history_line(stamp, text, lang, translation, translated))
+
+    def _on_gpu_installed(self) -> None:
+        """CUDA libraries were just installed: reload the model on the GPU."""
+        self.gpu_reason = self._gpu_reason_notified = ""
+        if self.running and self.cfg.device in ("auto", "cuda"):
+            self.overlay.clear()
+            self.start()
+
+    def _on_gpu_problem(self, reason: str) -> None:
+        self.gpu_reason = reason
+        if reason and reason != self._gpu_reason_notified:
+            self._gpu_reason_notified = reason
+            self._notify(f"Using the CPU: {reason}")
+        self._update_ui()
 
     def _write_transcript(self, line: str) -> None:
         try:
@@ -368,6 +431,7 @@ class Controller(QObject):
         self.dialog.applied.connect(self.apply_config)
         self.dialog.sample_requested.connect(self._show_sample)
         self.dialog.reset_position.connect(self._reset_position)
+        self.dialog.gpu_installed.connect(self._on_gpu_installed)
         self.dialog.finished.connect(self._dialog_closed)
         self.dialog.show()
         self.dialog.raise_()
@@ -379,10 +443,10 @@ class Controller(QObject):
         self.overlay.apply_config(self.cfg)
 
     def _show_sample(self) -> None:
-        self.overlay.add_final("みんなこんばんは！今日もよろしくね", "ja",
+        self.overlay.add_final(-1, "みんなこんばんは！今日もよろしくね", "ja",
                                "Good evening everyone! Let's have a good time today", False)
-        self.overlay.add_final("OK chat, let's go — we're doing the English challenge today!", "en", "", False)
-        self.overlay.set_partial("えっ、ちょっと待って…", "ja")
+        self.overlay.add_final(-2, "OK chat, let's go — we're doing the English challenge today!", "en", "", False)
+        self.overlay.set_partial("えっ、ちょっと待って…", "ja", 4)
 
     def _reset_position(self) -> None:
         cfg = self.dialog.collect() if self.dialog else self.cfg.copy()
@@ -462,16 +526,6 @@ class Controller(QObject):
         self.app.quit()
 
 
-def _setup_cuda_dlls() -> None:
-    """Make pip-installed NVIDIA cuBLAS/cuDNN DLLs (requirements-gpu.txt) visible to CTranslate2."""
-    for base in map(Path, sys.path):
-        nv = base / "nvidia"
-        if nv.is_dir():
-            for b in nv.glob("*/bin"):
-                os.add_dll_directory(str(b))
-                os.environ["PATH"] = str(b) + os.pathsep + os.environ.get("PATH", "")
-
-
 def _dark_palette(accent: QColor) -> QPalette:
     p = QPalette()
     roles = {
@@ -535,7 +589,7 @@ def apply_theme(theme: str) -> None:
 
 
 def main() -> int:
-    _setup_cuda_dlls()
+    gpu.setup_dll_paths()
 
     # Single instance
     mutex = ctypes.windll.kernel32.CreateMutexW(None, False, f"Local\\{APP_ID}")

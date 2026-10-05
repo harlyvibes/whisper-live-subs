@@ -13,8 +13,8 @@ from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QDia
                                QPlainTextEdit, QPushButton, QSpinBox, QTabWidget, QVBoxLayout,
                                QWidget)
 
-from . import modelstore
-from .config import FROZEN, MODELS, MODELS_DIR, Config, model_is_downloaded
+from . import gpu, modelstore
+from .config import MODELS, MODELS_DIR, Config, model_is_downloaded
 
 
 class ColorButton(QPushButton):
@@ -72,6 +72,9 @@ class SettingsDialog(QDialog):
     reset_position = Signal()
     _download_done = Signal(str, str)  # model, error
     _download_progress = Signal(str)   # progress text
+    _gpu_progress = Signal(str)
+    _gpu_done = Signal(str)            # error ("" = ok)
+    gpu_installed = Signal()
 
     def __init__(self, cfg: Config, parent=None):
         super().__init__(parent)
@@ -102,6 +105,8 @@ class SettingsDialog(QDialog):
 
         self._download_done.connect(self._on_download_done)
         self._download_progress.connect(self._on_download_progress)
+        self._gpu_progress.connect(lambda t: self.gpu_label.setText(t))
+        self._gpu_done.connect(self._on_gpu_done)
         self._load(self.cfg)
         self._loading = False
 
@@ -200,16 +205,14 @@ class SettingsDialog(QDialog):
         self.device_cb = self._bind("device", _combo([
             ("auto", "Auto (NVIDIA GPU if available)"), ("cpu", "CPU"), ("cuda", "NVIDIA GPU (CUDA)")]))
         f.addRow("Device:", self.device_cb)
-        try:
-            import ctranslate2
-            n = ctranslate2.get_cuda_device_count()
-        except Exception:  # noqa: BLE001
-            n = 0
-        f.addRow("", _hint(f"CUDA GPUs detected: {n}. " + (
-            "GPU mode is available." if n else
-            "Running on CPU. With an NVIDIA GPU, " + (
-                "use the Python version (setup.bat) for GPU acceleration." if FROZEN else
-                "install requirements-gpu.txt for 5-20× speed."))))
+        row = QHBoxLayout()
+        self.gpu_label = _hint("")
+        self.gpu_btn = QPushButton("Install GPU support")
+        self.gpu_btn.clicked.connect(self._install_gpu)
+        row.addWidget(self.gpu_label, 1)
+        row.addWidget(self.gpu_btn)
+        f.addRow("GPU:", row)
+        self._refresh_gpu()
         f.addRow("Precision:", self._bind("compute_type", _combo([
             ("auto", "Auto (float16 on GPU, int8 on CPU)"), ("int8", "int8 (fast, low memory)"),
             ("int8_float16", "int8_float16 (GPU)"), ("float16", "float16 (GPU)"),
@@ -290,7 +293,9 @@ class SettingsDialog(QDialog):
         f.addRow("", _hint("Translation uses Whisper's built-in translator. large-v3-turbo translates poorly; "
                            "use small/medium/large-v2/large-v3 for it. 'Both' needs ~2× the compute."))
         f.addRow("", self._bind("show_language_tags", QCheckBox("Prefix lines with a language tag ([JA] / [EN])")))
-        f.addRow("", self._bind("live_partials", QCheckBox("Live-updating captions while a phrase is being spoken")))
+        f.addRow("", self._bind("live_partials", QCheckBox("Live captions: show words as they are spoken")))
+        f.addRow("", self._bind("refine_captions", QCheckBox(
+            "Correct captions after they appear (a second, more careful pass fixes misheard words)")))
         prompt = self._bind("initial_prompt", QLineEdit())
         prompt.setPlaceholderText("Streamer / game names, slang… e.g. ぺこら, Hololive, Minecraft")
         f.addRow("Vocabulary hint:", prompt)
@@ -337,7 +342,7 @@ class SettingsDialog(QDialog):
         f.addRow("", row)
         f.addRow("Translation colour:", self._bind("translation_color", ColorButton(self.cfg.translation_color)))
         f.addRow("In-progress text:", self._bind("partial_style", _combo([
-            ("dim", "Slightly faded"), ("italic", "Italic"), ("same", "Same as final")])))
+            ("dim", "Unconfirmed words faded"), ("italic", "Italic"), ("same", "Same as final")])))
         row = QHBoxLayout()
         ow = self._bind("outline_width", QDoubleSpinBox())
         ow.setRange(0, 12)
@@ -483,6 +488,47 @@ class SettingsDialog(QDialog):
         self._update_model_status()
         if err:
             self.model_status.setText(f"Download failed: {err[:80]}")
+
+    # ---------- GPU ----------
+    def _refresh_gpu(self) -> None:
+        kind, text = gpu.status()
+        self.gpu_label.setText(text)
+        self.gpu_btn.setVisible(kind == "libs_missing")
+        self.gpu_btn.setEnabled(not getattr(self, "_gpu_installing", False))
+
+    def _install_gpu(self) -> None:
+        self._gpu_installing = True
+        self.gpu_btn.setEnabled(False)
+        self.gpu_label.setText("Downloading NVIDIA libraries: starting…")
+
+        def emit(sig, *args):
+            try:
+                sig.emit(*args)
+            except RuntimeError:  # dialog closed; install carries on
+                pass
+
+        def work():
+            err = ""
+            try:
+                mb = 1024 * 1024
+                gpu.install(lambda done, total, speed: emit(
+                    self._gpu_progress,
+                    f"Downloading NVIDIA libraries: {done * 100 // total}% · {done // mb:,} / {total // mb:,} MB"
+                    f" · {speed / mb:.1f} MB/s"))
+            except Exception as e:  # noqa: BLE001
+                err = str(e)
+            emit(self._gpu_done, err)
+
+        threading.Thread(target=work, daemon=True, name="gpu-install").start()
+
+    def _on_gpu_done(self, err: str) -> None:
+        self._gpu_installing = False
+        if err:
+            self.gpu_label.setText(f"GPU install failed: {err[:120]}")
+            self.gpu_btn.setEnabled(True)
+            return
+        self._refresh_gpu()
+        self.gpu_installed.emit()
 
     def _defaults(self) -> None:
         d = Config()
