@@ -33,8 +33,8 @@ Grab `WhisperLiveSubs-<version>-win64.zip` from [Releases](../../releases), extr
 **`WhisperLiveSubs.exe`**. It's portable: models download into the `models` folder next to the exe on first use.
 Windows SmartScreen may warn because the exe is unsigned: click *More info* → *Run anyway*.
 
-With an NVIDIA card, open Settings → Model and click **Install GPU support** (one-time ~1.2 GB download of
-NVIDIA's cuBLAS/cuDNN libraries into a `cuda` folder next to the exe).
+With an NVIDIA card, open Settings → Model and click **Install GPU support** (one-time ~530 MB download of
+NVIDIA's cuBLAS for CUDA 12 into a `cuda` folder next to the exe), then let the app restart.
 
 ## Run from source
 
@@ -71,12 +71,19 @@ or a local folder.
 
 ### NVIDIA GPU
 
-Settings → Model shows a **GPU** line explaining exactly what it found: no NVIDIA card/driver, a driver too old
-for CUDA 12, missing GPU libraries (with an **Install GPU support** button), or ready. The tray tooltip also says
-why the GPU isn't being used. With Device = *Auto*, the GPU is used whenever it works; otherwise the app falls
-back to the CPU and tells you why.
+The speech engine (CTranslate2 4.8) has the CUDA runtime built in. The only extra NVIDIA file it needs is
+**cuBLAS for CUDA 12** (`cublas64_12.dll`); it doesn't use cuDNN. Having "CUDA installed" isn't always enough:
+**a CUDA 13 toolkit ships `cublas64_13.dll`, which this engine can't use.**
 
-The from-source setup installs the same libraries when it finds an NVIDIA GPU. To add them by hand:
+- Settings → Model shows a **GPU** line explaining what it found: no NVIDIA card/driver, a driver too old for
+  CUDA 12, cuBLAS 12 missing (with an **Install GPU support** button), or ready (and where cuBLAS was found).
+- The app looks for cuBLAS 12 in its own `cuda` folder, pip's `nvidia-cublas-cu12`, any CUDA 12 toolkit
+  (`CUDA_PATH_V12_*`) and `PATH`, and loads it before the engine starts, so no PATH editing is needed.
+- The precision is chosen from what the card supports (e.g. GTX 10-series can't use float16).
+- If the GPU still isn't used, click **Copy GPU report** and include it in an issue: it lists the driver, GPU,
+  compute capability, where cuBLAS was found and the exact error.
+
+From source, the setup installs cuBLAS automatically when it finds an NVIDIA GPU. By hand:
 
 ```bash
 .venv\Scripts\python -m pip install -r requirements-gpu.txt
@@ -141,7 +148,7 @@ Whisper Live Subs.bat   launcher (no console)
 setup.bat               one-time dependency install
 livesubs/engine.py      VAD + streaming captions, instant finals, second-pass corrections
 livesubs/decoder.py     fast Whisper decoding (encoder window sized to the phrase)
-livesubs/gpu.py         NVIDIA detection + on-demand CUDA library install
+livesubs/gpu.py         NVIDIA detection, cuBLAS preload/installer, GPU report
 livesubs/audio.py       WASAPI loopback / microphone capture → 16 kHz mono
 livesubs/overlay.py     caption window (outlined text, click-through, drag/resize)
 livesubs/settings_dialog.py, app.py, hotkeys.py, config.py

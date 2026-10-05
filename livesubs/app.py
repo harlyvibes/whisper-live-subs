@@ -8,7 +8,7 @@ import winreg
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRectF, Qt
+from PySide6.QtCore import QObject, QProcess, QRectF, Qt
 from PySide6.QtGui import QActionGroup, QColor, QFont, QIcon, QPainter, QPalette, QPixmap, QTextCursor
 from PySide6.QtWidgets import (QApplication, QDialog, QHBoxLayout, QMenu, QPlainTextEdit, QStyleFactory,
                                QPushButton, QSystemTrayIcon, QVBoxLayout)
@@ -349,11 +349,28 @@ class Controller(QObject):
             self._write_transcript(self._history_line(stamp, text, lang, translation, translated))
 
     def _on_gpu_installed(self) -> None:
-        """CUDA libraries were just installed: reload the model on the GPU."""
-        self.gpu_reason = self._gpu_reason_notified = ""
-        if self.running and self.cfg.device in ("auto", "cuda"):
-            self.overlay.clear()
-            self.start()
+        """cuBLAS was just installed. CTranslate2 only tries to load it once per process,
+        so the GPU is picked up after a restart."""
+        from PySide6.QtWidgets import QMessageBox
+        parent = self.dialog
+        answer = QMessageBox.question(
+            parent, APP_NAME, "GPU support is installed. Restart Whisper Live Subs now to use the GPU?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer == QMessageBox.Yes:
+            self.restart_app()
+
+    def restart_app(self) -> None:
+        """Start a fresh copy of the app (it waits for this one to exit), then quit."""
+        if FROZEN:
+            program, args = sys.executable, []
+        else:
+            pyw = Path(sys.executable).with_name("pythonw.exe")
+            program, args = str(pyw if pyw.exists() else sys.executable), [str(PROJECT_DIR / "WhisperLiveSubs.pyw")]
+        args += ["--wait-for-pid", str(os.getpid())]
+        if QProcess.startDetached(program, args, str(PROJECT_DIR)):
+            self.quit()
+        else:
+            self._notify("Couldn't restart automatically. Please quit and start the app again.")
 
     def _on_gpu_problem(self, reason: str) -> None:
         self.gpu_reason = reason
@@ -590,6 +607,17 @@ def apply_theme(theme: str) -> None:
 
 def main() -> int:
     gpu.setup_dll_paths()
+
+    # Restarting: wait for the previous copy to exit so the single-instance check passes.
+    if "--wait-for-pid" in sys.argv:
+        try:
+            pid = int(sys.argv[sys.argv.index("--wait-for-pid") + 1])
+            h = ctypes.windll.kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+            if h:
+                ctypes.windll.kernel32.WaitForSingleObject(h, 15000)
+                ctypes.windll.kernel32.CloseHandle(h)
+        except (ValueError, IndexError):
+            pass
 
     # Single instance
     mutex = ctypes.windll.kernel32.CreateMutexW(None, False, f"Local\\{APP_ID}")

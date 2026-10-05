@@ -205,16 +205,22 @@ class SettingsDialog(QDialog):
         self.device_cb = self._bind("device", _combo([
             ("auto", "Auto (NVIDIA GPU if available)"), ("cpu", "CPU"), ("cuda", "NVIDIA GPU (CUDA)")]))
         f.addRow("Device:", self.device_cb)
-        row = QHBoxLayout()
         self.gpu_label = _hint("")
+        f.addRow("GPU:", self.gpu_label)
+        row = QHBoxLayout()
         self.gpu_btn = QPushButton("Install GPU support")
         self.gpu_btn.clicked.connect(self._install_gpu)
-        row.addWidget(self.gpu_label, 1)
+        self.gpu_report_btn = QPushButton("Copy GPU report")
+        self.gpu_report_btn.setToolTip("Copies GPU/driver/cuBLAS details and the last GPU error, "
+                                       "for troubleshooting.")
+        self.gpu_report_btn.clicked.connect(self._copy_gpu_report)
         row.addWidget(self.gpu_btn)
-        f.addRow("GPU:", row)
+        row.addWidget(self.gpu_report_btn)
+        row.addStretch()
+        f.addRow("", row)
         self._refresh_gpu()
         f.addRow("Precision:", self._bind("compute_type", _combo([
-            ("auto", "Auto (float16 on GPU, int8 on CPU)"), ("int8", "int8 (fast, low memory)"),
+            ("auto", "Auto (best the GPU supports; int8 on CPU)"), ("int8", "int8 (fast, low memory)"),
             ("int8_float16", "int8_float16 (GPU)"), ("float16", "float16 (GPU)"),
             ("float32", "float32 (slow, max precision)")])))
         threads = self._bind("cpu_threads", QSpinBox())
@@ -499,7 +505,7 @@ class SettingsDialog(QDialog):
     def _install_gpu(self) -> None:
         self._gpu_installing = True
         self.gpu_btn.setEnabled(False)
-        self.gpu_label.setText("Downloading NVIDIA libraries: starting…")
+        self.gpu_label.setText("Downloading NVIDIA cuBLAS: starting…")
 
         def emit(sig, *args):
             try:
@@ -513,13 +519,18 @@ class SettingsDialog(QDialog):
                 mb = 1024 * 1024
                 gpu.install(lambda done, total, speed: emit(
                     self._gpu_progress,
-                    f"Downloading NVIDIA libraries: {done * 100 // total}% · {done // mb:,} / {total // mb:,} MB"
+                    f"Downloading NVIDIA cuBLAS: {done * 100 // total}% · {done // mb:,} / {total // mb:,} MB"
                     f" · {speed / mb:.1f} MB/s"))
             except Exception as e:  # noqa: BLE001
                 err = str(e)
             emit(self._gpu_done, err)
 
         threading.Thread(target=work, daemon=True, name="gpu-install").start()
+
+    def _copy_gpu_report(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(gpu.report())
+        self.gpu_report_btn.setText("Copied ✔")
 
     def _on_gpu_done(self, err: str) -> None:
         self._gpu_installing = False

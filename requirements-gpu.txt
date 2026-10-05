@@ -1,5 +1,4 @@
-# Optional: NVIDIA GPU acceleration (CUDA 12). ~1.2 GB download.
-# cuDNN must match the cudnn64_9.dll dispatcher bundled with ctranslate2 4.8 (9.10.2.21).
-# (The app can also install these itself: Settings > Model > Install GPU support.)
+# Optional: NVIDIA GPU acceleration. ~530 MB download.
+# ctranslate2 4.8 (Windows) only needs cuBLAS for CUDA 12 (cublas64_12.dll); it doesn't use cuDNN.
+# (The app can also install it itself: Settings > Model > Install GPU support.)
 nvidia-cublas-cu12==12.9.2.10
-nvidia-cudnn-cu12==9.10.2.21

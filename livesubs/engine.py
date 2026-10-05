@@ -15,6 +15,7 @@ hysteresis so short ambiguous phrases stick with the current language.
 from __future__ import annotations
 
 import itertools
+import sys
 import threading
 import time
 import traceback
@@ -181,9 +182,17 @@ class CaptionEngine(QObject):
         elif device == "cuda" and n_cuda == 0:
             self.gpu_problem.emit(gpu.why_not_cuda() or "CUDA is not available.")
             device = "cpu"
+        if device == "cuda":
+            # CTranslate2 looks cublas64_12.dll up by name once per process; load the copy
+            # we found (app's cuda folder, pip, CUDA 12 toolkit, PATH) by full path first.
+            problem = gpu.preload()
+            if problem:
+                print("GPU preload:", problem, file=sys.stderr)
         ctype = cfg.compute_type
-        if ctype == "auto" or (device == "cpu" and "float16" in ctype):
-            ctype = "float16" if device == "cuda" else "int8"
+        if device == "cuda":
+            ctype = gpu.best_compute_type(ctype)  # e.g. GTX 10-series can't use float16
+        elif ctype == "auto" or "float16" in ctype:
+            ctype = "int8"
 
         if not model_is_downloaded(model_id):
             self.status.emit(f"Downloading '{model_id}': starting… (first use only)")
@@ -207,7 +216,7 @@ class CaptionEngine(QObject):
             m = WhisperModel(model_id, device=dev, compute_type=ct,
                              cpu_threads=cfg.cpu_threads, download_root=str(MODELS_DIR))
             d = FastDecoder(m)
-            # Warm up: forces CUDA/cuBLAS/cuDNN to load now so failures surface here.
+            # Warm up: forces CUDA/cuBLAS to load now so failures surface here.
             a = np.zeros(SR, dtype=np.float32)
             d.decode(d.encode(a), 1.0, "en", "transcribe")
             return m, d
@@ -218,6 +227,7 @@ class CaptionEngine(QObject):
             if device != "cuda":
                 raise
             traceback.print_exc()
+            gpu.record_error(e)
             self.gpu_problem.emit(gpu.explain_cuda_error(e))
             self.status.emit("GPU failed; using the CPU instead…")
             device, ctype = "cpu", "int8"
