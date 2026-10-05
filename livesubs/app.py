@@ -13,7 +13,7 @@ from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter,
 from PySide6.QtWidgets import (QApplication, QDialog, QHBoxLayout, QMenu, QPlainTextEdit,
                                QPushButton, QSystemTrayIcon, QVBoxLayout)
 
-from .config import APP_ID, APP_NAME, ENGINE_KEYS, MODELS, PROJECT_DIR, Config
+from .config import APP_ID, APP_NAME, ENGINE_KEYS, FROZEN, MODELS, PROJECT_DIR, Config
 from .engine import CaptionEngine
 from .hotkeys import GlobalHotkeys
 from .overlay import CaptionOverlay
@@ -409,7 +409,9 @@ class Controller(QObject):
     def _set_launch_at_login(self, enabled: bool) -> None:
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_ALL_ACCESS) as key:
-                if enabled:
+                if enabled and FROZEN:
+                    winreg.SetValueEx(key, APP_ID, 0, winreg.REG_SZ, f'"{sys.executable}"')
+                elif enabled:
                     pyw = Path(sys.executable).with_name("pythonw.exe")
                     exe = pyw if pyw.exists() else Path(sys.executable)
                     cmd = f'"{exe}" "{PROJECT_DIR / "WhisperLiveSubs.pyw"}"'

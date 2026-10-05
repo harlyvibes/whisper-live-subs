@@ -21,7 +21,15 @@ overlay that floats over every window, including browsers, players and borderles
 </tr>
 </table>
 
-## Start
+## Download (no Python needed)
+
+Grab `WhisperLiveSubs-<version>-win64.zip` from [Releases](../../releases), extract it anywhere, and run
+**`WhisperLiveSubs.exe`**. It's portable: models download into the `models` folder next to the exe on first use.
+Windows SmartScreen may warn because the exe is unsigned: click *More info* → *Run anyway*.
+
+The exe build runs on the CPU. For NVIDIA GPU acceleration, use the Python version below.
+
+## Run from source
 
 Double-click **`Whisper Live Subs.bat`**. On a fresh machine it runs `setup.bat` first, which creates
 `.venv` and installs the dependencies.
@@ -118,4 +126,5 @@ livesubs/audio.py       WASAPI loopback / microphone capture → 16 kHz mono
 livesubs/overlay.py     caption window (outlined text, click-through, drag/resize)
 livesubs/settings_dialog.py, app.py, hotkeys.py, config.py
 tools/make_screenshots.py   regenerates docs/*.png
+tools/build_exe.py          builds the standalone exe + zip (pip install pyinstaller first)
 ```

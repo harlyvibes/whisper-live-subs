@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QDia
                                QPlainTextEdit, QPushButton, QSpinBox, QTabWidget, QVBoxLayout,
                                QWidget)
 
-from .config import MODELS, MODELS_DIR, Config, model_is_downloaded
+from .config import FROZEN, MODELS, MODELS_DIR, Config, model_is_downloaded
 
 
 class ColorButton(QPushButton):
@@ -193,7 +193,9 @@ class SettingsDialog(QDialog):
             n = 0
         f.addRow("", _hint(f"CUDA GPUs detected: {n}. " + (
             "GPU mode is available." if n else
-            "Running on CPU. With an NVIDIA GPU, install requirements-gpu.txt for 5-20× speed.")))
+            "Running on CPU. With an NVIDIA GPU, " + (
+                "use the Python version (setup.bat) for GPU acceleration." if FROZEN else
+                "install requirements-gpu.txt for 5-20× speed."))))
         f.addRow("Precision:", self._bind("compute_type", _combo([
             ("auto", "Auto (float16 on GPU, int8 on CPU)"), ("int8", "int8 (fast, low memory)"),
             ("int8_float16", "int8_float16 (GPU)"), ("float16", "float16 (GPU)"),

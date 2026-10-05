@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 APP_NAME = "Whisper Live Subs"
 APP_ID = "WhisperLiveSubs"
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent
+FROZEN = getattr(sys, "frozen", False)  # running as the PyInstaller-built exe
+# Portable: in the exe build, models/ lives next to WhisperLiveSubs.exe.
+PROJECT_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).resolve().parent.parent
 MODELS_DIR = PROJECT_DIR / "models"
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_ID
 CONFIG_PATH = CONFIG_DIR / "settings.json"
