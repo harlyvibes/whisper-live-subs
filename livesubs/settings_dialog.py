@@ -5,7 +5,7 @@ import os
 import threading
 from dataclasses import fields
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPalette, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
                                QDoubleSpinBox, QFileDialog, QFontComboBox, QFormLayout,
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QDia
                                QPlainTextEdit, QPushButton, QSpinBox, QTabWidget, QVBoxLayout,
                                QWidget)
 
+from . import modelstore
 from .config import FROZEN, MODELS, MODELS_DIR, Config, model_is_downloaded
 
 
@@ -70,6 +71,7 @@ class SettingsDialog(QDialog):
     sample_requested = Signal()
     reset_position = Signal()
     _download_done = Signal(str, str)  # model, error
+    _download_progress = Signal(str)   # progress text
 
     def __init__(self, cfg: Config, parent=None):
         super().__init__(parent)
@@ -99,6 +101,7 @@ class SettingsDialog(QDialog):
         lay.addWidget(bb)
 
         self._download_done.connect(self._on_download_done)
+        self._download_progress.connect(self._on_download_progress)
         self._load(self.cfg)
         self._loading = False
 
@@ -157,7 +160,14 @@ class SettingsDialog(QDialog):
     def _refresh_states(self) -> None:
         self.custom_model.setEnabled(self.model_cb.currentData() == "custom")
         m = next((m for m in MODELS if m[0] == self.model_cb.currentData()), None)
-        self.model_desc.setText(m[3] if m else "")
+        desc = m[3] if m else ""
+        need = modelstore.RAM_NEEDED_GB.get(m[0]) if m else None
+        if need:
+            total, free = modelstore.ram_gb()
+            warn = " ⚠ more than is free now — may fail to load." if free < need else ""
+            desc += (f"\nOn CPU it needs about {need:.1f} GB of free RAM to load "
+                     f"(this PC: {free:.1f} of {total:.0f} GB free).{warn}")
+        self.model_desc.setText(desc)
         self._update_model_status()
         self.allowed.setEnabled(self.lang_cb.currentData() == "auto")
         self.ja_color.setEnabled(self.sep_ja.isChecked())
@@ -431,7 +441,7 @@ class SettingsDialog(QDialog):
     def _update_model_status(self) -> None:
         mid = self.custom_model.text().strip() if self.model_cb.currentData() == "custom" else self.model_cb.currentData()
         if getattr(self, "_downloading", None) == mid:
-            self.model_status.setText("Downloading…")
+            self.model_status.setText(getattr(self, "_download_text", "Downloading…"))
             self.dl_btn.setEnabled(False)
             return
         ok = model_is_downloaded(mid) if mid else False
@@ -445,16 +455,28 @@ class SettingsDialog(QDialog):
         self._downloading = mid
         self._update_model_status()
 
+        self._download_text = "Downloading: starting…"
+
+        def emit(sig, *args):
+            try:
+                sig.emit(*args)
+            except RuntimeError:  # dialog was closed; the download carries on
+                pass
+
         def work():
             err = ""
             try:
-                from faster_whisper.utils import download_model
-                download_model(mid, cache_dir=str(MODELS_DIR))
+                modelstore.download(mid, lambda done, total, speed: emit(
+                    self._download_progress, modelstore.format_progress(mid, done, total, speed)))
             except Exception as e:  # noqa: BLE001
                 err = str(e)
-            self._download_done.emit(mid, err)
+            emit(self._download_done, mid, err)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _on_download_progress(self, text: str) -> None:
+        self._download_text = "Downloading:" + text.split(":", 1)[1]  # model name is already shown above
+        self._update_model_status()
 
     def _on_download_done(self, mid: str, err: str) -> None:
         self._downloading = None

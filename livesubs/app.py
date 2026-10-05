@@ -8,12 +8,12 @@ import winreg
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPoint, QRectF, Qt
-from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPalette, QPixmap
+from PySide6.QtCore import QObject, QRectF, Qt
+from PySide6.QtGui import QActionGroup, QColor, QFont, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (QApplication, QDialog, QHBoxLayout, QMenu, QPlainTextEdit, QStyleFactory,
                                QPushButton, QSystemTrayIcon, QVBoxLayout)
 
-from .config import APP_ID, APP_NAME, ENGINE_KEYS, FROZEN, MODELS, PROJECT_DIR, Config
+from .config import APP_ID, APP_NAME, ENGINE_KEYS, FROZEN, MODELS, PROJECT_DIR, Config, model_is_downloaded
 from .engine import CaptionEngine
 from .hotkeys import GlobalHotkeys
 from .overlay import CaptionOverlay
@@ -89,6 +89,8 @@ class Controller(QObject):
         self.status = ""
         self.dialog: SettingsDialog | None = None
         self.transcript_path: Path | None = None
+        self.last_good_model: tuple[str, str] | None = None  # (model, custom_model) that loaded OK
+        self.pending_note = ""  # shown again once the fallback model is listening
 
         self.overlay = CaptionOverlay(self.cfg)
         self.overlay.geometry_changed.connect(self._on_overlay_moved)
@@ -221,6 +223,7 @@ class Controller(QObject):
         e.partial.connect(self.overlay.set_partial)
         e.final.connect(self._on_final)
         e.model_info.connect(self._on_model_info)
+        e.load_failed.connect(self._on_load_failed)
         e.set_paused(self.paused)
         self.running = True
         self.state = "loading"
@@ -240,7 +243,7 @@ class Controller(QObject):
 
     @staticmethod
     def _disconnect(e: CaptionEngine) -> None:
-        for sig in (e.status, e.state, e.partial, e.final, e.model_info):
+        for sig in (e.status, e.state, e.partial, e.final, e.model_info, e.load_failed):
             try:
                 sig.disconnect()
             except (RuntimeError, TypeError):
@@ -248,17 +251,38 @@ class Controller(QObject):
 
     def _on_status(self, text: str) -> None:
         self.status = text
-        persistent = text.startswith(("Downloading", "Loading"))
+        # Progress and errors stay on screen until the next status replaces them.
+        persistent = text.startswith(("Downloading", "Loading", "Not enough", "Could not", "Engine error"))
         self.overlay.show_status(text, 0 if persistent else 5)
-        if text.startswith(("Could not", "Engine error", "GPU failed")):
+        if text.startswith(("Could not open", "Engine error", "GPU failed")):
             self._notify(text)
         self._update_ui()
 
     def _on_state(self, state: str) -> None:
         self.state = state
+        if state == "listening":
+            self.last_good_model = (self.cfg.model, self.cfg.custom_model)
+            if self.pending_note:
+                self.overlay.show_status(self.pending_note, 12)
+                self.pending_note = ""
+                self._update_ui()
+                return
         if state == "listening" and self.overlay.status_text.startswith(("Downloading", "Loading")):
             self.overlay.show_status(self.status, 3)
         self._update_ui()
+
+    def _on_load_failed(self, msg: str, out_of_memory: bool) -> None:
+        """A model failed to load: go back to the last one that worked so captions keep running."""
+        fallback = self.last_good_model
+        current = (self.cfg.model, self.cfg.custom_model)
+        if fallback is None and out_of_memory and self.cfg.model != "small" and model_is_downloaded("small"):
+            fallback = ("small", self.cfg.custom_model)
+        if fallback and fallback != current:
+            self.pending_note = f"{msg} Switched back to '{fallback[0]}'."
+            self._notify(self.pending_note)
+            self._quick_set(model=fallback[0], custom_model=fallback[1])
+        else:
+            self._notify(msg)
 
     def _on_model_info(self, info: str) -> None:
         self.model_info = info
@@ -511,7 +535,6 @@ def apply_theme(theme: str) -> None:
 
 
 def main() -> int:
-    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
     _setup_cuda_dlls()
 
     # Single instance

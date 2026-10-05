@@ -28,7 +28,7 @@ def make_icon() -> Path:
 
     from livesubs.app import make_icon as qicon
 
-    app = QApplication.instance() or QApplication([])  # noqa: F841
+    QApplication.instance() or QApplication([])  # needed before using QPixmap
     ico = BUILD / "icon.ico"
     ico.parent.mkdir(parents=True, exist_ok=True)
     qicon("listening").pixmap(256, 256).toImage().save(str(ico))
@@ -44,7 +44,6 @@ def main() -> None:
         "--collect-data", "faster_whisper",     # Silero VAD model
         "--collect-binaries", "ctranslate2",
         "--hidden-import", "pyaudiowpatch",
-        "--collect-all", "hf_xet",              # fast Hugging Face model downloads
         # Qt modules the app never uses (keeps the download smaller)
         *[a for m in ("QtWebEngineCore", "QtWebEngineWidgets", "QtQuick", "QtQml", "Qt3DCore",
                       "QtMultimedia", "QtPdf", "QtCharts", "QtDataVisualization", "QtSql",

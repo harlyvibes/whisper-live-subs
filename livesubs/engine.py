@@ -22,7 +22,8 @@ from PySide6.QtCore import QObject, Signal
 
 from .audio import SAMPLE_RATE as SR
 from .audio import AudioCapture
-from .config import MODELS, MODELS_DIR, Config, model_is_downloaded
+from . import modelstore
+from .config import MODELS_DIR, Config, model_is_downloaded
 
 VAD_WINDOW = 512                     # samples per Silero frame (32 ms)
 NO_SPACE_LANGS = {"ja", "zh", "yue", "th", "lo", "my", "km"}
@@ -39,6 +40,7 @@ class CaptionEngine(QObject):
     partial = Signal(str, str)           # text, lang ("" text clears)
     final = Signal(str, str, str, bool)  # text, lang, translation, text_is_translated
     model_info = Signal(str)             # e.g. "small · CPU int8"
+    load_failed = Signal(str, bool)      # message, was_out_of_memory
 
     def __init__(self, cfg: Config, wait_for: threading.Thread | None = None):
         super().__init__()
@@ -74,7 +76,15 @@ class CaptionEngine(QObject):
             self._load_model(self.cfg)
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
-            self.status.emit(f"Could not load model: {e}")
+            oom = modelstore.is_memory_error(e)
+            if oom:
+                total, free = modelstore.ram_gb()
+                msg = (f"Not enough memory to load '{self.cfg.model_id()}' "
+                       f"({free:.1f} of {total:.0f} GB RAM free). Close other apps or pick a smaller model.")
+            else:
+                msg = f"Could not load model '{self.cfg.model_id()}': {e}"
+            self.status.emit(msg)
+            self.load_failed.emit(msg, oom)
             self.state.emit("error")
             return
         if self._stop.is_set():
@@ -92,7 +102,18 @@ class CaptionEngine(QObject):
         self.status.emit(f"Listening to: {cap.device_label}")
         self.state.emit("listening")
         try:
-            self._loop(cap)
+            while True:
+                try:
+                    self._loop(cap)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if not modelstore.is_memory_error(e) or self._stop.is_set():
+                        raise
+                    # Out of memory mid-phrase: drop it and keep captioning.
+                    traceback.print_exc()
+                    self.partial.emit("", "")
+                    self.status.emit("Low on memory — skipped a phrase. Close other apps or pick a smaller model.")
+                    time.sleep(1)
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
             self.status.emit(f"Engine error: {e}")
@@ -118,10 +139,22 @@ class CaptionEngine(QObject):
             ctype = "float16" if device == "cuda" else "int8"
 
         if not model_is_downloaded(model_id):
-            size = next((m[2] for m in MODELS if m[0] == model_id), "")
-            self.status.emit(f"Downloading model '{model_id}' {f'({size}) ' if size else ''}— first run only…")
-        else:
-            self.status.emit(f"Loading model '{model_id}' on {device.upper()}…")
+            self.status.emit(f"Downloading '{model_id}': starting… (first use only)")
+            modelstore.download(
+                model_id,
+                lambda done, total, speed: self.status.emit(
+                    modelstore.format_progress(model_id, done, total, speed)),
+                should_stop=self._stop.is_set)
+            if self._stop.is_set():
+                return
+
+        msg = f"Loading '{model_id}' on {device.upper()}…"
+        need = modelstore.RAM_NEEDED_GB.get(model_id)
+        if device == "cpu" and need:
+            total, free = modelstore.ram_gb()
+            if free < need:
+                msg += f" (needs ~{need:.1f} GB RAM, {free:.1f} GB free — may be slow or fail)"
+        self.status.emit(msg)
 
         def load(dev: str, ct: str):
             m = WhisperModel(model_id, device=dev, compute_type=ct,

@@ -54,8 +54,12 @@ Double-click **`Whisper Live Subs.bat`**. On a fresh machine it runs `setup.bat`
 | **large-v3-turbo** | 1.6 GB | Best choice with an NVIDIA GPU. Weak at *translation* |
 | large-v2 / large-v3 | 3 GB | Most accurate. GPU strongly recommended |
 
-Models download automatically on first use into `models/`. You can also pre-download them from
-Settings → Model. *Custom* accepts any CTranslate2 Whisper model, either a Hugging Face repo id
+Models download automatically on first use into `models/`, with live progress (%, MB, speed) on the overlay,
+the tray tooltip and Settings → Model, where you can also pre-download them. The Model tab shows how much free
+RAM each model needs on this PC. If a model can't load (e.g. not enough memory), the app says so and switches back
+to the last model that worked.
+
+CPU memory use is about the download size + 0.35 GB (e.g. medium ≈ 1.9 GB), so medium runs on a 4 GB PC. *Custom* accepts any CTranslate2 Whisper model, either a Hugging Face repo id
 or a local folder.
 
 ### NVIDIA GPU
