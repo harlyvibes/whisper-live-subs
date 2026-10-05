@@ -110,6 +110,7 @@ class Config:
     # --- Behaviour ---
     auto_hide_s: float = 6.0        # 0 = never clear
     start_on_launch: bool = True
+    ui_theme: str = "system"        # system | light | dark (settings window, menus)
     launch_at_login: bool = False
     save_transcript: bool = False
     transcript_dir: str = DEFAULT_TRANSCRIPT_DIR

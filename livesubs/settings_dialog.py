@@ -6,7 +6,7 @@ import threading
 from dataclasses import fields
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPixmap
+from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPalette, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
                                QDoubleSpinBox, QFileDialog, QFontComboBox, QFormLayout,
                                QHBoxLayout, QKeySequenceEdit, QLabel, QLineEdit,
@@ -56,7 +56,11 @@ def _combo(items: list[tuple[str, str]]) -> QComboBox:
 def _hint(text: str) -> QLabel:
     lab = QLabel(text)
     lab.setWordWrap(True)
-    lab.setStyleSheet("color: palette(placeholder-text); font-size: 11px;")
+    # Palette role (not a stylesheet colour) so it follows light/dark theme switches live.
+    lab.setForegroundRole(QPalette.PlaceholderText)
+    f = lab.font()
+    f.setPointSizeF(f.pointSizeF() * 0.85)
+    lab.setFont(f)
     return lab
 
 
@@ -392,6 +396,8 @@ class SettingsDialog(QDialog):
         ah.setSpecialValueText("Never")
         f.addRow("Clear captions after silence:", ah)
         f.addRow("", self._bind("locked", QCheckBox("Lock overlay (click-through, cannot be moved)")))
+        f.addRow("App theme:", self._bind("ui_theme", _combo([
+            ("system", "Match Windows"), ("light", "Light"), ("dark", "Dark")])))
         f.addRow("", self._bind("start_on_launch", QCheckBox("Start captioning when the app launches")))
         f.addRow("", self._bind("launch_at_login", QCheckBox("Launch when I sign in to Windows")))
         self.save_tr = self._bind("save_transcript", QCheckBox("Save transcripts to text files"))

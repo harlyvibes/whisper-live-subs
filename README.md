@@ -82,7 +82,8 @@ Device = *Auto* then uses the GPU. If the GPU fails, the app falls back to CPU a
   (e.g. 「ご視聴ありがとうございました」). The list is editable.
 
 Other options include font, size, bold, text/Japanese/translation colours, outline, shadow,
-background colour and opacity, box shape, lines shown, alignment, width, auto-clear delay,
+background colour and opacity, box shape, lines shown, alignment, width, auto-clear delay, app theme
+(follows Windows light/dark automatically, or force Light/Dark),
 transcript saving, caption history window, launch at Windows sign-in, and the global hotkeys.
 
 ## Screenshots

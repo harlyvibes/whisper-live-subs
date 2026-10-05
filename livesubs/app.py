@@ -9,8 +9,8 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QPoint, QRectF, Qt
-from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import (QApplication, QDialog, QHBoxLayout, QMenu, QPlainTextEdit,
+from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPalette, QPixmap
+from PySide6.QtWidgets import (QApplication, QDialog, QHBoxLayout, QMenu, QPlainTextEdit, QStyleFactory,
                                QPushButton, QSystemTrayIcon, QVBoxLayout)
 
 from .config import APP_ID, APP_NAME, ENGINE_KEYS, FROZEN, MODELS, PROJECT_DIR, Config
@@ -103,6 +103,7 @@ class Controller(QObject):
         self.hotkeys.triggered.connect(self._on_hotkey)
         self.hotkeys.failed.connect(self._on_hotkey_failed)
         self._apply_hotkeys()
+        apply_theme(self.cfg.ui_theme)
 
         self.tray = QSystemTrayIcon(make_icon("stopped"))
         self.menu = QMenu()
@@ -389,6 +390,8 @@ class Controller(QObject):
         if (old.hotkey_pause, old.hotkey_overlay, old.hotkey_lock) != \
                 (cfg.hotkey_pause, cfg.hotkey_overlay, cfg.hotkey_lock):
             self._apply_hotkeys()
+        if old.ui_theme != cfg.ui_theme:
+            apply_theme(cfg.ui_theme)
         if old.launch_at_login != cfg.launch_at_login:
             self._set_launch_at_login(cfg.launch_at_login)
         if old.save_transcript != cfg.save_transcript or old.transcript_dir != cfg.transcript_dir:
@@ -445,6 +448,68 @@ def _setup_cuda_dlls() -> None:
                 os.environ["PATH"] = str(b) + os.pathsep + os.environ.get("PATH", "")
 
 
+def _dark_palette(accent: QColor) -> QPalette:
+    p = QPalette()
+    roles = {
+        QPalette.Window: "#202020", QPalette.WindowText: "#ffffff", QPalette.Base: "#2b2b2b",
+        QPalette.AlternateBase: "#323232", QPalette.Text: "#ffffff", QPalette.Button: "#2d2d2d",
+        QPalette.ButtonText: "#ffffff", QPalette.BrightText: "#ff6b6b", QPalette.Light: "#3c3c3c",
+        QPalette.Midlight: "#333333", QPalette.Mid: "#262626", QPalette.Dark: "#1a1a1a",
+        QPalette.Shadow: "#000000", QPalette.ToolTipBase: "#2b2b2b", QPalette.ToolTipText: "#ffffff",
+        QPalette.PlaceholderText: "#9d9d9d", QPalette.HighlightedText: "#ffffff",
+        QPalette.Link: "#6cb6ff", QPalette.LinkVisited: "#b48ead",
+    }
+    for role, c in roles.items():
+        p.setColor(role, QColor(c))
+    p.setColor(QPalette.Highlight, accent)
+    p.setColor(QPalette.Accent, accent)
+    for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
+        p.setColor(QPalette.Disabled, role, QColor("#7a7a7a"))
+    p.setColor(QPalette.Disabled, QPalette.Base, QColor("#252525"))
+    p.setColor(QPalette.Disabled, QPalette.Button, QColor("#262626"))
+    p.setColor(QPalette.Disabled, QPalette.Highlight, QColor("#4a4a4a"))
+    return p
+
+
+def _refresh_palette() -> None:
+    """Apply a complete light/dark palette (Fusion on Windows 10).
+
+    The palette Windows hands Qt in dark mode is inconsistent: its per-class
+    checkbox palette paints unchecked boxes in the accent colour, and placeholder
+    text is pure white. Setting our own palette for every class avoids both.
+    """
+    app = QApplication.instance()
+    if app.style().name().lower() != "fusion":
+        return  # the native windows11 style handles light/dark itself
+    dark = app.styleHints().colorScheme() == Qt.ColorScheme.Dark
+    accent = QColor(app.style().standardPalette().color(QPalette.Highlight))
+    pal = _dark_palette(QColor("#0078d4") if not accent.isValid() else accent) if dark         else app.style().standardPalette()
+    app.setPalette(pal)
+    for cls in ("QCheckBox", "QRadioButton", "QAbstractButton", "QMenu", "QComboBox",
+                "QAbstractItemView", "QLineEdit", "QTextEdit", "QPlainTextEdit", "QHeaderView"):
+        app.setPalette(pal, cls)
+
+
+def setup_style(app: QApplication) -> None:
+    """Use a style that follows the Windows light/dark setting, live.
+
+    Qt's default 'windowsvista' style is always light. Windows 11 gets the native
+    'windows11' style; Windows 10 gets Fusion with our own palettes.
+    """
+    win11 = sys.getwindowsversion().build >= 22000
+    keys = [k.lower() for k in QStyleFactory.keys()]
+    app.setStyle("windows11" if win11 and "windows11" in keys else "Fusion")
+    app.styleHints().colorSchemeChanged.connect(lambda *_: _refresh_palette())
+    _refresh_palette()
+
+
+def apply_theme(theme: str) -> None:
+    """'system' follows Windows; 'light'/'dark' override it."""
+    scheme = {"light": Qt.ColorScheme.Light, "dark": Qt.ColorScheme.Dark}.get(theme, Qt.ColorScheme.Unknown)
+    QApplication.styleHints().setColorScheme(scheme)
+    _refresh_palette()
+
+
 def main() -> int:
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
     _setup_cuda_dlls()
@@ -461,6 +526,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)
+    setup_style(app)
     app.setWindowIcon(make_icon("listening"))
     if not QSystemTrayIcon.isSystemTrayAvailable():
         print("System tray not available")

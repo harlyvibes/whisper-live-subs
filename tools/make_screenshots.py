@@ -75,6 +75,8 @@ def overlay_shot(cfg: Config, name: str, lines, partial=None, w=1280, h=520) -> 
 def main() -> None:
     DOCS.mkdir(exist_ok=True)
     app = QApplication(sys.argv)
+    app_mod.setup_style(app)
+    app_mod.apply_theme("light")  # consistent README images whatever the Windows theme
 
     cfg = Config()
     cfg.locked = True             # no dashed "unlocked" frame
