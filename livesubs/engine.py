@@ -29,10 +29,14 @@ from . import gpu, modelstore
 from .audio import SAMPLE_RATE as SR
 from .audio import AudioCapture
 from .config import MODELS_DIR, Config, model_is_downloaded
-from .decoder import NO_SPACE_LANGS, FastDecoder, Result, norm
+from .decoder import NO_SPACE_LANGS, FastDecoder, Result, collapse_repeats, find_repeat, norm, units
 
 VAD_WINDOW = 512                     # samples per Silero frame (32 ms)
 PARTIAL_STEP_S = 0.25                # re-decode after this much new audio
+FIRST_PARTIAL_S = 0.8                # shorter clips mostly decode to guesses ("Thank you.")
+MAX_TAIL_WORDS = 3                   # unconfirmed words shown after the confirmed ones
+MAX_TAIL_CHARS = 6                   # same for Japanese/Chinese (characters)
+USE_PREFIX = True                    # force confirmed words as the decoder prefix
 MAX_PENDING_REFINES = 4
 
 
@@ -49,18 +53,69 @@ class _Refine:
 
 
 def _stable_prefix(old: str, new: str, lang: str) -> int:
-    """Length of the prefix of `new` that `old` agrees with, cut at a word boundary."""
-    n = 0
-    for a, b in zip(old, new):
-        if a != b:
-            break
-        n += 1
-    if n == len(new):
-        return n
-    if lang not in NO_SPACE_LANGS:  # don't mark half a word as stable
-        cut = new.rfind(" ", 0, n + 1)
-        n = cut if cut > 0 else 0
-    return n
+    """Chars of `new` (cut at a word end) that the previous pass agrees with. Case and
+    punctuation are ignored, so "today. Thank" vs "today, thank" counts as agreement."""
+    a, b = units(old, lang), units(new, lang)
+    k = 0
+    while k < min(len(a), len(b)) and a[k][2] == b[k][2]:
+        k += 1
+    return b[k - 1][1] if k else 0
+
+
+def _cap_tail(text: str, stable: int, lang: str, mid_word: bool) -> str:
+    """Show at most a few unconfirmed words after the confirmed ones. If speech is still
+    going at the very end of the audio, the last word was cut off mid-way and Whisper's
+    guess at it is usually wrong ("I fell" -> "I fell in love with you"), so hide it."""
+    tail = [u for u in units(text, lang) if u[0] >= stable]
+    if mid_word and tail:
+        tail = tail[:-(2 if lang in NO_SPACE_LANGS else 1)]
+    limit = MAX_TAIL_CHARS if lang in NO_SPACE_LANGS else MAX_TAIL_WORDS
+    tail = tail[:limit]
+    return text[:tail[-1][1]] if tail else text[:stable]
+
+
+def _resays(confirmed: str, text: str, lang: str) -> bool:
+    """True if the words decoded after a forced prefix re-say the end of that prefix, e.g.
+    confirmed "...I really appreciate it." + "I really appreciate the support.": the confirmed
+    words were wrong and Whisper is correcting them by repeating."""
+    a = [x[2] for x in units(confirmed, lang)][-8:]
+    b = [x[2] for x in units(text, lang)][len(units(confirmed, lang)):]
+    k = 3 if lang in NO_SPACE_LANGS else 2
+    if len(b) < k:
+        return False
+    head = b[:k]
+    return any(a[i:i + k] == head for i in range(len(a) - k + 1))
+
+
+def _has_echo(text: str, lang: str) -> bool:
+    """A span of >= 4 words (8 Japanese chars) appearing twice: a loop with small variations."""
+    u = [x[2] for x in units(text, lang)]
+    k = 8 if lang in NO_SPACE_LANGS else 4
+    seen = set()
+    for i in range(len(u) - k + 1):
+        key = tuple(u[i:i + k])
+        if key in seen:
+            return True
+        seen.add(key)
+    return False
+
+
+def _strip_overlap(prev: str, new: str, lang: str) -> str:
+    """Drop words at the start of `new` that repeat the end of `prev` (phrase cut mid-speech)."""
+    a, b = units(prev, lang), units(new, lang)
+    least = 4 if lang in NO_SPACE_LANGS else 2
+    for k in range(min(len(a), len(b), 12), least - 1, -1):
+        if [x[2] for x in a[-k:]] == [x[2] for x in b[:k]]:
+            return new[b[k - 1][1]:].lstrip(" 、,.。")
+    return new
+
+
+def _copies_context(context: str, text: str, lang: str) -> bool:
+    """Whisper sometimes parrots the context prompt instead of transcribing."""
+    a, b = units(context, lang), units(text, lang)
+    least = 6 if lang in NO_SPACE_LANGS else 3
+    return any([x[2] for x in a[-k:]] == [x[2] for x in b[:k]]
+               for k in range(least, min(len(a), len(b)) + 1))
 
 
 class CaptionEngine(QObject):
@@ -85,10 +140,13 @@ class CaptionEngine(QObject):
         self._prev_lang: str | None = None
         self._last_final_text = ""      # context for the next caption's second pass
         self._last_final_id = 0
+        self._split_carry = ""         # caption cut mid-speech; next one may overlap it
         self.model = None
         self.dec: FastDecoder | None = None
         self.on_gpu = False
         self._refines: deque[_Refine] = deque()
+        self._refine_cv = threading.Condition()
+        self._refine_thread: threading.Thread | None = None
         self.thread = threading.Thread(target=self._run, name="CaptionEngine", daemon=True)
 
     # ---- control (called from the GUI thread) ----
@@ -140,6 +198,8 @@ class CaptionEngine(QObject):
 
         self.status.emit(f"Listening to: {cap.device_label}")
         self.state.emit("listening")
+        self._refine_thread = threading.Thread(target=self._refine_worker, name="CaptionRefiner", daemon=True)
+        self._refine_thread.start()
         try:
             while True:
                 try:
@@ -159,6 +219,10 @@ class CaptionEngine(QObject):
             self.state.emit("error")
         finally:
             cap.stop()
+            with self._refine_cv:
+                self._refine_cv.notify_all()
+            if self._refine_thread is not None:
+                self._refine_thread.join(10)
             self._settle_all()
             self.model = self.dec = None
         if self._stop.is_set():
@@ -248,12 +312,13 @@ class CaptionEngine(QObject):
         last_audio = time.monotonic()
         last_partial_len = 0
         utt_lang: str | None = None
-        partial_text = ""          # latest partial shown for the current phrase
+        partial_text = ""          # latest full live decode for the current phrase
         partial_lang = ""
+        confirmed = ""             # words two passes agreed on: forced prefix for the next pass
 
         def reset_phrase():
-            nonlocal last_partial_len, utt_lang, partial_text, partial_lang
-            last_partial_len, utt_lang, partial_text, partial_lang = 0, None, "", ""
+            nonlocal last_partial_len, utt_lang, partial_text, partial_lang, confirmed
+            last_partial_len, utt_lang, partial_text, partial_lang, confirmed = 0, None, "", "", ""
 
         def clear_partial():
             if partial_text:
@@ -279,7 +344,6 @@ class CaptionEngine(QObject):
             # WASAPI loopback delivers nothing while nothing is playing.
             stalled = (now - last_audio) * 1000 >= cfg.silence_ms
             if buf.size < SR * 0.3 and not (stalled and buf.size):
-                self._maybe_refine(idle=True)
                 continue
 
             probs = self._speech_probs(buf)
@@ -287,7 +351,6 @@ class CaptionEngine(QObject):
             if speech.size == 0:
                 clear_partial()
                 buf = buf[-int(SR * 0.4):] if not stalled else buf[:0]
-                self._maybe_refine(idle=True)
                 continue
 
             # Drop leading non-speech (keep 200 ms of lead-in).
@@ -302,7 +365,9 @@ class CaptionEngine(QObject):
                 g = gaps[0]
                 end = min(len(buf), (speech[g] + 1) * VAD_WINDOW - start + int(SR * 0.15))
                 nxt = max(end, speech[g + 1] * VAD_WINDOW - start - int(SR * 0.2))
-                usable = partial_text if last_partial_len >= end - int(SR * 0.1) else ""
+                next_start = speech[g + 1] * VAD_WINDOW - start
+                # Only reuse the live text if it covered this phrase and none of the next one.
+                usable = partial_text if end - int(SR * 0.1) <= last_partial_len <= next_start else ""
                 self._finalize(buf[:end], cfg, partial=(usable, partial_lang))
                 buf = buf[nxt:]
                 reset_phrase()
@@ -322,19 +387,19 @@ class CaptionEngine(QObject):
                 cut = self._finalize(buf, cfg, partial=("", ""), split=True)
                 buf = buf[cut:]
                 reset_phrase()
-            elif (cfg.live_partials and len(buf) >= SR * 0.5
+            elif (cfg.live_partials and len(buf) >= SR * FIRST_PARTIAL_S
                   and len(buf) - last_partial_len >= SR * PARTIAL_STEP_S):
-                text, lang = self._decode_partial(buf, cfg, utt_lang)
+                text, lang = self._decode_partial(buf, cfg, utt_lang, confirmed)
                 utt_lang = utt_lang or lang
                 last_partial_len = len(buf)
                 if text and not self._stop.is_set() and not self._paused:
                     stable = _stable_prefix(partial_text, text, lang) if partial_lang == lang else 0
-                    self.partial.emit(text, lang, stable)
+                    confirmed = text[:stable]
+                    mid_word = bool(probs[-6:].mean() >= cfg.vad_threshold)  # speech in the last ~0.2 s
+                    shown = _cap_tail(text, stable, lang, mid_word)
+                    if shown:
+                        self.partial.emit(shown, lang, min(stable, len(shown)))
                     partial_text, partial_lang = text, lang
-                # On a GPU there's time to polish captions between partials.
-                self._maybe_refine(idle=False)
-            else:
-                self._maybe_refine(idle=False)
 
     # ---- decoding steps ----
     def _lang_and_task(self, cfg: Config, lang: str) -> tuple[str, bool]:
@@ -367,11 +432,23 @@ class CaptionEngine(QObject):
                     return sep.join(s[2] for s in kept).strip()
         return res.text
 
-    def _decode_partial(self, audio: np.ndarray, cfg: Config, locked: str | None) -> tuple[str, str]:
+    def _decode_partial(self, audio: np.ndarray, cfg: Config, locked: str | None,
+                        confirmed: str) -> tuple[str, str]:
+        """Live pass. Confirmed words are forced as a prefix so they can't flicker; only the
+        continuation is decoded. Low-confidence passes are skipped ("" keeps the last one)."""
         enc = self.dec.encode(audio)
         lang = self._pick_lang(enc, cfg, locked)
         task, _ = self._lang_and_task(cfg, lang)
-        res = self.dec.robust_decode(audio, enc, lang, task, beam=1, prompt=cfg.initial_prompt)
+        prefix = confirmed if (USE_PREFIX and locked == lang) else ""
+        res = self.dec.decode(enc, len(audio) / SR, lang, task, beam=1, prompt=cfg.initial_prompt,
+                              prefix=prefix)
+        if prefix and (_resays(prefix, res.text, lang) or res.looks_bad):
+            # The confirmed words were wrong; decode freely instead of building on them.
+            res = self.dec.decode(enc, len(audio) / SR, lang, task, beam=1, prompt=cfg.initial_prompt)
+        if res.looped:  # cheap fix for a live pass; the second pass re-decodes properly
+            res.text = collapse_repeats(res.text, lang)
+        if res.avg_logprob < -1.0 or res.no_speech_prob > 0.6:
+            return "", lang
         return self._filter(res, cfg), lang
 
     def _finalize(self, audio: np.ndarray, cfg: Config, partial: tuple[str, str], split: bool = False) -> int:
@@ -380,13 +457,15 @@ class CaptionEngine(QObject):
             self.partial.emit("", "", 0)
             return len(audio)
         text, lang = partial
+        if text and (find_repeat(text, lang) or _has_echo(text, lang)):
+            text = ""
         cut = len(audio)
         if not text or split:
             enc = self.dec.encode(audio)
             lang = self._pick_lang(enc, cfg, None)
             task, _ = self._lang_and_task(cfg, lang)
             res = self.dec.robust_decode(audio, enc, lang, task, beam=max(1, cfg.beam_size),
-                                         prompt=cfg.initial_prompt, timestamps=split, careful=True)
+                                         prompt=cfg.initial_prompt, timestamps=split)
             if split and len(res.segments) >= 2:
                 last_start = int(res.segments[-1][0] * SR)
                 if SR < last_start < len(audio):
@@ -395,6 +474,9 @@ class CaptionEngine(QObject):
                     sep = "" if (lang in NO_SPACE_LANGS and task == "transcribe") else " "
                     res.text = sep.join(s[2] for s in res.segments)
             text = self._filter(res, cfg)
+        if self._split_carry and text:
+            text = _strip_overlap(self._split_carry, text, lang)
+        self._split_carry = ""
         _, translated = self._lang_and_task(cfg, lang)
         trans = ""
         if text and cfg.output_mode == "both" and lang != "en" and not cfg.refine_captions:
@@ -409,23 +491,38 @@ class CaptionEngine(QObject):
         fid = next(self._ids)
         context = self._last_final_text if self._prev_lang == lang else ""
         self._prev_lang, self._last_final_text, self._last_final_id = lang, text, fid
+        if split and cut < len(audio):
+            self._split_carry = text  # the rest of this speech continues in the next caption
         self.final.emit(fid, text, lang, trans, translated)
         job = _Refine(fid, audio[:cut].copy(), lang, text, trans, translated, context, time.monotonic())
         if cfg.refine_captions:
-            self._refines.append(job)
-            while len(self._refines) > MAX_PENDING_REFINES:  # falling behind: keep what's shown
-                self._settle(self._refines.popleft())
+            with self._refine_cv:
+                self._refines.append(job)
+                while len(self._refines) > MAX_PENDING_REFINES:  # falling behind: keep what's shown
+                    self._settle(self._refines.popleft())
+                self._refine_cv.notify()
         else:
             self._settle(job)
         return cut
 
     # ---- second pass: correct captions already on screen ----
-    def _maybe_refine(self, idle: bool) -> None:
-        if not self._refines or self.dec is None:
-            return
-        overdue = time.monotonic() - self._refines[0].queued_at > 4.0
-        if idle or self.on_gpu or overdue:
-            self._refine(self._refines.popleft())
+    def _refine_worker(self) -> None:
+        """Runs the second pass off the capture loop, so finals are never held up by it."""
+        while True:
+            with self._refine_cv:
+                while not self._refines and not self._stop.is_set():
+                    self._refine_cv.wait(0.5)
+                if self._stop.is_set():
+                    return
+                job = self._refines.popleft()
+            if self._paused or self.dec is None:
+                self._settle(job)
+                continue
+            try:
+                self._refine(job)
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+                self._settle(job)
 
     def _refine(self, job: _Refine) -> None:
         cfg = self.cfg
@@ -437,15 +534,15 @@ class CaptionEngine(QObject):
         task, translated = self._lang_and_task(cfg, lang)
         prompt = " ".join(p for p in (cfg.initial_prompt.strip(), job.context if lang == job.lang else "") if p)
         beam = max(5, cfg.beam_size)
-        res = self.dec.robust_decode(audio, enc, lang, task, beam=beam, prompt=prompt, careful=True)
-        if job.context and res.looks_bad:  # context occasionally derails Whisper; retry without it
-            res = self.dec.robust_decode(audio, enc, lang, task, beam=beam, prompt=cfg.initial_prompt,
-                                         careful=True)
+        res = self.dec.robust_decode(audio, enc, lang, task, beam=beam, prompt=prompt)
+        if job.context and (res.looks_bad or _copies_context(job.context, res.text, lang)):
+            # context occasionally derails Whisper (repeats it); retry without it
+            res = self.dec.robust_decode(audio, enc, lang, task, beam=beam, prompt=cfg.initial_prompt)
         text = self._filter(res, cfg) or job.text
         trans = job.translation
         if cfg.output_mode == "both" and lang != "en":
-            trans = self._filter(self.dec.robust_decode(audio, enc, lang, "translate", beam=beam, prompt="",
-                                                        careful=True), cfg) or trans
+            trans = self._filter(self.dec.robust_decode(audio, enc, lang, "translate", beam=beam, prompt=""),
+                                 cfg) or trans
         elif cfg.output_mode != "both":
             trans = ""
         if self._stop.is_set():
@@ -460,5 +557,6 @@ class CaptionEngine(QObject):
         self.settled.emit(job.id, job.text, job.lang, job.translation, job.translated)
 
     def _settle_all(self) -> None:
-        while self._refines:
-            self._settle(self._refines.popleft())
+        with self._refine_cv:
+            while self._refines:
+                self._settle(self._refines.popleft())

@@ -45,7 +45,7 @@ def _tag(lang: str, translated: bool) -> str:
 
 
 class CaptionOverlay(QWidget):
-    geometry_changed = Signal(int, int, int)   # x, bottom, width
+    geometry_changed = Signal(int, int, int, int)   # x, bottom, width, height (0 = auto)
     font_size_changed = Signal(int)
     context_menu_requested = Signal(QPoint)
     settings_requested = Signal()
@@ -66,7 +66,7 @@ class CaptionOverlay(QWidget):
         self._lines: list[_Line] = []
         self._drag_mode: str | None = None
         self._drag_origin = QPoint()
-        self._drag_geom = (0, 0, 0)
+        self._drag_geom = (0, 0, 0, 0)
 
         self._hide_timer = QTimer(self, singleShot=True, timeout=self._auto_clear)
         self._status_timer = QTimer(self, singleShot=True, timeout=self._clear_status)
@@ -175,8 +175,11 @@ class CaptionOverlay(QWidget):
             color = QColor(c.text_color)
         italic = partial and c.partial_style == "italic"
         tag = _tag(e.lang, e.translated) if tags and e.lang else ""
-        text = tag + e.text
+        body = e.text[:e.stable] if (partial and c.partial_style == "hide" and e.stable >= 0) else e.text
+        text = tag + body
         font = self._font(italic)
+        if not body.strip():
+            return []
         if partial and c.partial_style == "dim":
             # Words two passes agree on are solid; the newest, still-changing words are faded.
             faded = QColor(color)
@@ -202,25 +205,36 @@ class CaptionOverlay(QWidget):
     def _relayout(self) -> None:
         c = self.cfg
         width = self._content_width()
+        fm = QFontMetricsF(self._font())
+        line_h = fm.height() * 1.05
+        chrome = 2 * c.padding + 2 * c.outline_width + 4
+        fixed = c.overlay_height > 0
+        fit = max(1, int((c.overlay_height - chrome) // line_h)) if fixed else max(1, c.max_lines)
+
+        status: list[_Line] = []
+        if self.status_text:
+            col = QColor("#ffcfd8dc")
+            status = [_line(t, col, True) for t in self._wrap(self.status_text, self._font(True), width)]
         lines: list[_Line] = []
         for e in self.entries:
             lines += self._entry_lines(e, False, width)
         if self.partial is not None:
             lines += self._entry_lines(self.partial, True, width)
-        lines = lines[-max(1, c.max_lines):]
-        if self.status_text:
-            col = QColor("#ffcfd8dc")
-            lines += [_line(t, col, True) for t in self._wrap(self.status_text, self._font(True), width)]
+        room = max(0, fit - len(status)) if fixed else fit
+        lines = (lines[-room:] if room else []) + status
+        if fixed:
+            lines = lines[-fit:]
         if not lines and not c.locked:
-            hint = ("Captions appear here · drag to move · drag sides to resize · "
+            hint = ("Captions appear here · drag to move · drag edges to resize · "
                     "Ctrl+scroll for size · lock from tray")
             col = QColor("#ccffffff")
             lines = [_line(t, col, True) for t in self._wrap(hint, self._font(True), width)]
         self._lines = lines
 
-        fm = QFontMetricsF(self._font())
-        line_h = fm.height() * 1.05
-        h = int(len(lines) * line_h + 2 * c.padding + 2 * c.outline_width + 4) if lines else 1
+        if fixed:
+            h = max(int(line_h + chrome), c.overlay_height)
+        else:
+            h = int(len(lines) * line_h + chrome) if lines else 1
         self._place(h)
         self.update()
 
@@ -253,13 +267,15 @@ class CaptionOverlay(QWidget):
         widths = [metrics(l.italic).horizontalAdvance(l.text) for l in self._lines]
         pad = c.padding + c.outline_width
         block_w = min(self.width(), max(widths) + 2 * pad + 4)
+        block_h = min(self.height(), len(self._lines) * line_h + 2 * pad + 4)
+        top = self.height() - block_h  # captions sit at the bottom, like subtitles
 
         # Background box
         if c.bg_fit == "full":
             bg = QRectF(0, 0, self.width(), self.height())
         else:
             bx = {"left": 0, "right": self.width() - block_w}.get(c.alignment, (self.width() - block_w) / 2)
-            bg = QRectF(bx, 0, block_w, self.height())
+            bg = QRectF(bx, top, block_w, block_h)
         bgc = QColor(c.bg_color)
         if bgc.alpha() > 0:
             p.setPen(Qt.NoPen)
@@ -277,7 +293,7 @@ class CaptionOverlay(QWidget):
         shadow_col = QColor(c.shadow_color)
         shadow_pen = QPen(shadow_col, max(1.0, c.outline_width * 2), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
 
-        y = pad + 2
+        y = top + pad + 2
         for line, w in zip(self._lines, widths):
             font = self._font(line.italic)
             if c.alignment == "left":
@@ -303,45 +319,66 @@ class CaptionOverlay(QWidget):
         p.end()
 
     # ---------- interaction (only when unlocked) ----------
-    def _edge(self, x: int) -> str | None:
-        if x <= EDGE:
-            return "left"
-        if x >= self.width() - EDGE:
-            return "right"
-        return None
+    def _edge(self, pos) -> str:
+        """Which edges the cursor is on: any of 'l', 'r', 't', 'b' ('' = middle, i.e. move)."""
+        x, y = int(pos.x()), int(pos.y())
+        grab = min(EDGE, max(4, self.height() // 4))
+        return (("l" if x <= EDGE else "r" if x >= self.width() - EDGE else "")
+                + ("t" if y <= grab else "b" if y >= self.height() - grab else ""))
+
+    @staticmethod
+    def _cursor_for(edge: str):
+        if edge in ("l", "r"):
+            return Qt.SizeHorCursor
+        if edge in ("t", "b"):
+            return Qt.SizeVerCursor
+        if edge in ("lt", "rb"):
+            return Qt.SizeFDiagCursor
+        if edge in ("rt", "lb"):
+            return Qt.SizeBDiagCursor
+        return Qt.SizeAllCursor
 
     def mousePressEvent(self, ev) -> None:
         if ev.button() == Qt.LeftButton:
-            self._drag_mode = self._edge(int(ev.position().x())) or "move"
+            self._drag_mode = self._edge(ev.position()) or "move"
             self._drag_origin = ev.globalPosition().toPoint()
-            self._drag_geom = (self.x(), self.y() + self.height(), self.width())
+            self._drag_geom = (self.x(), self.y() + self.height(), self.width(), self.height())
         elif ev.button() == Qt.RightButton:
             self.context_menu_requested.emit(ev.globalPosition().toPoint())
 
     def mouseMoveEvent(self, ev) -> None:
         if self._drag_mode is None:
-            edge = self._edge(int(ev.position().x()))
-            self.setCursor(Qt.SizeHorCursor if edge else Qt.SizeAllCursor)
+            self.setCursor(self._cursor_for(self._edge(ev.position())))
             return
         d = ev.globalPosition().toPoint() - self._drag_origin
-        x0, b0, w0 = self._drag_geom
+        x0, b0, w0, h0 = self._drag_geom
         c = self.cfg
-        if self._drag_mode == "move":
-            c.overlay_x, c.overlay_bottom = x0 + d.x(), b0 + d.y()
-        elif self._drag_mode == "right":
-            c.overlay_x, c.overlay_width = x0, max(200, w0 + d.x())
-        else:
-            nw = max(200, w0 - d.x())
-            c.overlay_x, c.overlay_width = x0 + w0 - nw, nw
+        mode = self._drag_mode
         if c.overlay_bottom < 0:
             c.overlay_bottom = b0
+        if mode == "move":
+            c.overlay_x, c.overlay_bottom = x0 + d.x(), b0 + d.y()
+        else:
+            if "r" in mode:
+                c.overlay_x, c.overlay_width = x0, max(200, w0 + d.x())
+            elif "l" in mode:
+                nw = max(200, w0 - d.x())
+                c.overlay_x, c.overlay_width = x0 + w0 - nw, nw
+            min_h = int(QFontMetricsF(self._font()).height() * 1.05 + 2 * c.padding
+                        + 2 * c.outline_width + 4)
+            if "t" in mode:      # bottom edge stays put
+                c.overlay_height = max(min_h, h0 - d.y())
+                c.overlay_bottom = b0
+            elif "b" in mode:    # top edge stays put
+                c.overlay_height = max(min_h, h0 + d.y())
+                c.overlay_bottom = b0 - h0 + c.overlay_height
         self._relayout()
 
     def mouseReleaseEvent(self, ev) -> None:
         if self._drag_mode is not None:
             self._drag_mode = None
             c = self.cfg
-            self.geometry_changed.emit(self.x(), self.y() + self.height(), c.overlay_width)
+            self.geometry_changed.emit(self.x(), self.y() + self.height(), c.overlay_width, c.overlay_height)
 
     def mouseDoubleClickEvent(self, ev) -> None:
         self.settings_requested.emit()

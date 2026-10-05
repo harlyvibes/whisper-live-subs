@@ -348,7 +348,7 @@ class SettingsDialog(QDialog):
         f.addRow("", row)
         f.addRow("Translation colour:", self._bind("translation_color", ColorButton(self.cfg.translation_color)))
         f.addRow("In-progress text:", self._bind("partial_style", _combo([
-            ("dim", "Unconfirmed words faded"), ("italic", "Italic"), ("same", "Same as final")])))
+            ("dim", "Unconfirmed words faded"), ("hide", "Hide unconfirmed words (no flicker, slightly later)"), ("italic", "Italic"), ("same", "Same as final")])))
         row = QHBoxLayout()
         ow = self._bind("outline_width", QDoubleSpinBox())
         ow.setRange(0, 12)
@@ -399,6 +399,13 @@ class SettingsDialog(QDialog):
         row.addWidget(rp)
         row.addStretch()
         f.addRow("Overlay width:", row)
+        oh = self._bind("overlay_height", QSpinBox())
+        oh.setRange(0, 4000)
+        oh.setSuffix(" px")
+        oh.setSpecialValueText("Auto (fits the text)")
+        f.addRow("Overlay height:", oh)
+        f.addRow("", _hint("Or drag the top/bottom edge of the unlocked overlay. A fixed height shows as many "
+                           "lines as fit, newest at the bottom; 'Lines shown' applies to Auto."))
         op = self._bind("window_opacity", QSpinBox())
         op.setRange(10, 100)
         op.setSuffix(" %")
@@ -566,9 +573,11 @@ class SettingsDialog(QDialog):
         self.cfg.overlay_x, self.cfg.overlay_bottom = cfg.overlay_x, cfg.overlay_bottom
         self.original.overlay_x, self.original.overlay_bottom = cfg.overlay_x, cfg.overlay_bottom
         self.original.overlay_width = cfg.overlay_width
+        self.cfg.overlay_height = self.original.overlay_height = cfg.overlay_height
         if "overlay_width" in self._binds:
             self._loading = True
             self._binds["overlay_width"][1](cfg.overlay_width)
+            self._binds["overlay_height"][1](cfg.overlay_height)
             self._binds["font_size"][1](cfg.font_size)
             self.original.font_size = cfg.font_size
             self._loading = False

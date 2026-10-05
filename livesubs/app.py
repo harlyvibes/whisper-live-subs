@@ -158,6 +158,7 @@ class Controller(QObject):
         self.act_lock = m.addAction("Lock overlay (click-through)", self.toggle_lock)
         self.act_lock.setCheckable(True)
         m.addAction("Clear captions", self.overlay.clear)
+        m.addAction("Auto-fit overlay height", lambda: self._quick_set(overlay_height=0))
         m.addSeparator()
 
         self.model_menu = m.addMenu("Model")
@@ -474,8 +475,9 @@ class Controller(QObject):
         if self.dialog:
             self.dialog.sync_geometry(cfg)
 
-    def _on_overlay_moved(self, x: int, bottom: int, width: int) -> None:
+    def _on_overlay_moved(self, x: int, bottom: int, width: int, height: int) -> None:
         self.cfg.overlay_x, self.cfg.overlay_bottom, self.cfg.overlay_width = x, bottom, width
+        self.cfg.overlay_height = height
         self.cfg.save()
         if self.dialog:
             self.dialog.sync_geometry(self.cfg)

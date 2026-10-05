@@ -106,6 +106,7 @@ class Config:
     overlay_x: int = -1             # -1 = centre on primary screen
     overlay_bottom: int = -1
     overlay_width: int = 1100
+    overlay_height: int = 0         # 0 = auto (fits the text); else fixed, captions bottom-aligned
     locked: bool = False
 
     # --- Behaviour ---

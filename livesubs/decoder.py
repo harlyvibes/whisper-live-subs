@@ -10,6 +10,7 @@ loop, the pass is retried on the full 30 s window.
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
 from dataclasses import dataclass, field
 
@@ -29,6 +30,76 @@ def norm(text: str) -> str:
     return "".join(ch for ch in text.lower() if unicodedata.category(ch)[0] not in "PSZC")
 
 
+def units(text: str, lang: str) -> list[tuple[int, int, str]]:
+    """Comparable units with their (start, end) offsets in `text`: words for spaced languages,
+    characters for Japanese/Chinese. Punctuation and case are ignored."""
+    out = []
+    if lang in NO_SPACE_LANGS:
+        for i, ch in enumerate(text):
+            n = norm(ch)
+            if n:
+                out.append((i, i + 1, n))
+    else:
+        for m in re.finditer(r"\S+", text):
+            n = norm(m.group())
+            if n:
+                out.append((m.start(), m.end(), n))
+    return out
+
+
+def _min_span(lang: str) -> int:
+    return 6 if lang in NO_SPACE_LANGS else 3  # chars / words
+
+
+def find_repeat(text: str, lang: str) -> tuple[int, int] | None:
+    """(start, end) offsets of the text to cut when Whisper got stuck in a loop, else None.
+
+    A decoding loop repeats a span back to back and runs to the end of the text, e.g.
+    "...lost all of my diamonds. Oh no, I fell into the lava and lost all of my diamonds. Oh no"
+    Real speech repeats too ("Thank you so much. Thank you so much for the super chat",
+    "wait, wait", "うんうんうん"), but then carries on, so it is left alone:
+      * long span (>= 3 words / 6 Japanese chars): 2 copies reaching the end, or 3+ copies;
+      * short span: 4+ copies of a 2-word span, or 5+ copies of anything shorter.
+    The cut runs from the end of the first copy to the end of the text that loops.
+    """
+    offs = units(text, lang)
+    u = [x[2] for x in offs]
+    n = len(u)
+    big = _min_span(lang)
+    for k in range(1, n // 2 + 1):
+        if k >= big:
+            need_anywhere, need_at_end = 3, 2
+        elif k == 2 and lang not in NO_SPACE_LANGS:
+            need_anywhere = need_at_end = 4      # "let's go, let's go, let's go" is a chant, not a loop
+        else:
+            need_anywhere = need_at_end = 5
+        for i in range(0, n - need_at_end * k + 1):
+            span = u[i:i + k]
+            copies = 1
+            while i + (copies + 1) * k <= n and u[i + copies * k:i + (copies + 1) * k] == span:
+                copies += 1
+            if copies < need_at_end:
+                continue
+            rest = u[i + copies * k:]
+            trailing_partial = len(rest) < k and rest == span[:len(rest)]  # loop cut off mid-copy
+            if copies >= need_anywhere or trailing_partial:
+                last = n - 1 if trailing_partial and rest else i + copies * k - 1
+                return offs[i + k - 1][1], offs[last][1]
+    return None
+
+
+def collapse_repeats(text: str, lang: str) -> str:
+    for _ in range(10):
+        r = find_repeat(text, lang)
+        if r is None:
+            break
+        a, b = r
+        text = (text[:a] + text[b:]).strip()
+        text = re.sub(r"([。．.!?！？])[。．.!?！？]+", r"\1", text)
+        text = re.sub(r"\s{2,}", " ", text)
+    return text
+
+
 @dataclass
 class Result:
     text: str = ""
@@ -39,9 +110,14 @@ class Result:
     compression: float = 1.0
 
     @property
+    def looped(self) -> bool:
+        return find_repeat(self.text, self.lang) is not None
+
+    @property
     def looks_bad(self) -> bool:
         """Repetition loop or very unsure decode: worth retrying."""
-        return self.compression > 2.4 or (self.avg_logprob < -1.0 and self.no_speech_prob < 0.6)
+        return (self.compression > 2.4 or self.looped
+                or (self.avg_logprob < -1.0 and self.no_speech_prob < 0.6))
 
 
 class FastDecoder:
@@ -81,10 +157,13 @@ class FastDecoder:
 
     # ---- decoder ----
     def decode(self, enc, secs: float, lang: str, task: str, *, beam: int = 1, prompt: str = "",
-               timestamps: bool = False, temperature: float = 0.0) -> Result:
+               timestamps: bool = False, temperature: float = 0.0, prefix: str = "") -> Result:
+        """prefix: words already confirmed for this phrase; the decoder is forced to start with
+        them (and they are included in the result), so only the continuation can change."""
         tk = self.tokenizer(task, lang)
         previous = tk.encode(" " + prompt.strip())[-200:] if prompt.strip() else []
-        tokens = self.model.get_prompt(tk, previous, without_timestamps=not timestamps)
+        tokens = self.model.get_prompt(tk, previous, without_timestamps=not timestamps,
+                                       prefix=prefix.strip() or None)
         max_new = min(220, int(secs * 14) + 24)  # generous for Japanese, stops runaway loops early
         kw = dict(beam_size=max(1, beam), patience=1.0, length_penalty=1.0,
                   max_length=len(tokens) + max_new, return_scores=True, return_no_speech_prob=True,
@@ -120,18 +199,25 @@ class FastDecoder:
                       compression=get_compression_ratio(text) if text else 1.0)
 
     def robust_decode(self, audio: np.ndarray, enc, lang: str, task: str, *, beam: int, prompt: str,
-                      timestamps: bool = False, careful: bool = False) -> Result:
+                      timestamps: bool = False, careful: bool = False, prefix: str = "") -> Result:
         """Decode; on a repetition loop/unsure result retry with the full window (and, if
-        careful, with temperature fallback like Whisper's own transcribe())."""
+        careful, with temperature fallback like Whisper's own transcribe()). A loop that
+        survives the retries is collapsed to a single copy."""
         secs = len(audio) / SR
-        res = self.decode(enc, secs, lang, task, beam=beam, prompt=prompt, timestamps=timestamps)
+        res = self.decode(enc, secs, lang, task, beam=beam, prompt=prompt, timestamps=timestamps,
+                          prefix=prefix)
         if not res.looks_bad:
             return res
         full = self.encode(audio, full=True)
-        res = self.decode(full, secs, lang, task, beam=beam, prompt=prompt, timestamps=timestamps)
+        retry = self.decode(full, secs, lang, task, beam=beam, prompt=prompt, timestamps=timestamps)
         if careful:
             for t in (0.2, 0.4, 0.6):
-                if not res.looks_bad:
+                if not retry.looks_bad:
                     break
-                res = self.decode(full, secs, lang, task, prompt=prompt, timestamps=timestamps, temperature=t)
+                retry = self.decode(full, secs, lang, task, prompt=prompt, timestamps=timestamps, temperature=t)
+        res = retry if (not retry.looks_bad or res.looped) else res
+        if res.looped:
+            res.text = collapse_repeats(res.text, lang)
+            res.segments = []  # offsets no longer match the text
+            res.compression = get_compression_ratio(res.text) if res.text else 1.0
         return res

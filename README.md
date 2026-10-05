@@ -9,7 +9,11 @@ The app lives in the **system tray** (the blue 字 icon) and draws captions in a
 overlay that floats over every window, including browsers, players and borderless-fullscreen games.
 
 - **Near word-by-word:** captions update about every 0.3 s while someone is talking, even on a CPU.
-  Words two updates agree on are drawn solid; the newest, still-changing words are faded.
+  Words two updates agree on are drawn solid and locked in; at most a few newer words are shown faded, and a
+  word that is still being spoken is held back until it's finished (Whisper's guesses at half-heard words are
+  where most "nonsense" came from). Prefer no flicker at all? Settings → Appearance → *Hide unconfirmed words*.
+- **No repeat loops:** Whisper sometimes repeats a phrase over and over; loops are detected and redone or
+  collapsed, while real repeats ("wait, wait", "let's go, let's go") are kept.
 - **Self-correcting:** when a phrase ends it becomes a caption immediately, then a second, more careful pass
   re-listens to it in the background. If it hears something different, the caption already on screen is
   corrected in place (and in the caption history and transcript).
@@ -41,7 +45,9 @@ NVIDIA's cuBLAS for CUDA 12 into a `cuda` folder next to the exe), then let the 
 Double-click **`Whisper Live Subs.bat`**. On a fresh machine it runs `setup.bat` first, which creates
 `.venv` and installs the dependencies.
 
-- **Move** the overlay: drag it. **Resize**: drag its left or right edge. **Font size**: Ctrl+mouse wheel.
+- **Move** the overlay: drag it. **Resize**: drag any edge or corner. Dragging the top/bottom edge sets a fixed
+  height (captions stay at the bottom, as many lines as fit); tray → *Auto-fit overlay height* undoes it.
+  **Font size**: Ctrl+mouse wheel.
 - **Lock** it (tray → *Lock overlay*, or `Ctrl+Alt+L`) to make it click-through so it never gets in the way.
 - **Double-click** the tray icon or overlay to open Settings. Right-click either one for the menu.
 
